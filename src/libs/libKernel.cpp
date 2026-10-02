@@ -1433,7 +1433,23 @@ static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
 	LOGF("\tposix open: ptr=%p preview=\"%s\" flags=%08x mode=%04x\n",
 	     static_cast<const void*>(path), path != nullptr ? preview : "<null>",
 	     static_cast<unsigned>(flags), static_cast<unsigned>(mode));
-	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, mode));
+	const int fd = POSIX_N_CALL(FileSystem::KernelOpen(path, flags, mode));
+	// PS5 RetroArch links RADV statically; core_loader still probes libvulkan.so
+	// for the generic vulkan video path. Missing .so is expected on this title —
+	// prefer video_driver=ps5 for software/llvmpipe hosts.
+	if (fd < 0 && path != nullptr &&
+	    (std::strcmp(preview, "libvulkan.so") == 0 ||
+	     std::strcmp(preview, "libvulkan.so.1") == 0)) {
+		static bool s_vulkan_so_hint = false;
+		if (!s_vulkan_so_hint) {
+			s_vulkan_so_hint = true;
+			LOGF_COLOR(Log::Color::Yellow,
+			           "\t hint: guest libvulkan.so not found (errno from open). "
+			           "PS5 RetroArch embeds RADV; use video_driver=ps5 to avoid "
+			           "the Vulkan init DirectMemory thrash on software GPUs.\n");
+		}
+	}
+	return fd;
 }
 
 static int KYTY_SYSV_ABI close(int d) {
