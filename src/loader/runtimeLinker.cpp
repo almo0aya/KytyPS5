@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ucontext.h>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
@@ -676,6 +677,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+		// NULL call soft-continue: guest called through a NULL function pointer (unresolved
+		// font/FreeType/video font backend under XMB). Treat as a stub that returns 0/NULL so
+		// RetroArch can proceed on --allow-software-gpu (video_ps5) instead of aborting.
+		if (Config::AllowSoftwareGpu() && info->exception_address == 0 &&
+		    info->access_violation_vaddr == 0 && info->native_context != nullptr &&
+		    IsReadableRange(info->rsp, sizeof(uint64_t))) {
+			const auto ret = *reinterpret_cast<const uint64_t*>(info->rsp);
+			auto* uctx = static_cast<ucontext_t*>(info->native_context);
+#if defined(__APPLE__)
+			uctx->uc_mcontext->__ss.__rax = 0;
+			uctx->uc_mcontext->__ss.__rsp = static_cast<__uint64_t>(info->rsp + 8);
+			uctx->uc_mcontext->__ss.__rip = static_cast<__uint64_t>(ret);
+#else
+			uctx->uc_mcontext.gregs[REG_RAX] = 0;
+			uctx->uc_mcontext.gregs[REG_RSP] = static_cast<greg_t>(info->rsp + 8);
+			uctx->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(ret);
+#endif
+			static std::atomic<int> null_calls{0};
+			const int n = null_calls.fetch_add(1) + 1;
+			if (n <= 8 || (n & 0xff) == 0) {
+				std::printf("NULL call soft-continue #%d: returning to 0x%016" PRIx64
+				            " rax=0 (allow-software-gpu)\n",
+				            n, ret);
+				std::fflush(stdout);
+			}
+			return true;
+		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -717,6 +745,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
 	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	return false;
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
