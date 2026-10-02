@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <getopt.h>
+#include <libgen.h>
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
@@ -316,13 +317,31 @@ static KYTY_SYSV_ABI int puts(const char* s) {
 }
 
 // Guest-only environment (do not touch host environ).
-static std::unordered_map<std::string, std::string> g_guest_env = {
-    {"HOME", "/app0"},
-    {"USER", "kyty"},
-    {"TMPDIR", "/temp0"},
-    {"TMP", "/temp0"},
-    {"TEMP", "/temp0"},
-};
+// Pointers returned by getenv must remain stable across later setenv calls, so
+// values live in strdup'd buffers rather than std::string::c_str().
+static std::mutex g_guest_env_mutex;
+static std::unordered_map<std::string, char*> g_guest_env;
+
+static void EnsureDefaultGuestEnvLocked() {
+	static bool initialized = false;
+	if (initialized) {
+		return;
+	}
+	initialized = true;
+	const std::pair<const char*, const char*> defaults[] = {
+	    {"HOME", "/app0"},
+	    {"USER", "kyty"},
+	    {"TMPDIR", "/temp0"},
+	    {"TMP", "/temp0"},
+	    {"TEMP", "/temp0"},
+	    {"XDG_CONFIG_HOME", "/app0/config"},
+	    {"XDG_CACHE_HOME", "/temp0"},
+	    {"XDG_DATA_HOME", "/app0"},
+	};
+	for (const auto& [k, v]: defaults) {
+		g_guest_env.emplace(k, ::strdup(v));
+	}
+}
 
 static const char* FindEnvInEnvp(const char* name) {
 	if (g_envp == nullptr || name == nullptr) {
@@ -347,15 +366,22 @@ static KYTY_SYSV_ABI char* getenv(const char* name) {
 		return nullptr;
 	}
 
-	if (const auto it = g_guest_env.find(name); it != g_guest_env.end()) {
-		return const_cast<char*>(it->second.c_str());
+	{
+		std::lock_guard lock(g_guest_env_mutex);
+		EnsureDefaultGuestEnvLocked();
+		if (const auto it = g_guest_env.find(name); it != g_guest_env.end()) {
+			LOGF("\t getenv -> %s\n", it->second != nullptr ? it->second : "<null>");
+			return it->second;
+		}
 	}
 
 	if (const char* from_envp = FindEnvInEnvp(name); from_envp != nullptr) {
+		LOGF("\t getenv (envp) -> %s\n", from_envp);
 		return const_cast<char*>(from_envp);
 	}
 
 	// Not found — NULL is the correct POSIX result (not a crash).
+	LOGF("\t getenv -> <unset>\n");
 	return nullptr;
 }
 
@@ -373,11 +399,47 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 		return -1;
 	}
 
-	// Guest environment changes must not leak into emulator host libraries.
-	if (!overwrite && g_guest_env.find(name) != g_guest_env.end()) {
+	std::lock_guard lock(g_guest_env_mutex);
+	EnsureDefaultGuestEnvLocked();
+	if (const auto it = g_guest_env.find(name); it != g_guest_env.end()) {
+		if (!overwrite) {
+			return 0;
+		}
+		char* copy = ::strdup(value);
+		if (copy == nullptr) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+			return -1;
+		}
+		::free(it->second);
+		it->second = copy;
 		return 0;
 	}
-	g_guest_env[name] = value;
+
+	char* copy = ::strdup(value);
+	if (copy == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return -1;
+	}
+	g_guest_env.emplace(name, copy);
+	return 0;
+}
+
+static KYTY_SYSV_ABI int unsetenv(const char* name) {
+	PRINT_NAME();
+
+	LOGF("\t unsetenv name = %s\n", name != nullptr ? name : "<null>");
+
+	if (name == nullptr || name[0] == '\0' || std::strchr(name, '=') != nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+
+	std::lock_guard lock(g_guest_env_mutex);
+	EnsureDefaultGuestEnvLocked();
+	if (const auto it = g_guest_env.find(name); it != g_guest_env.end()) {
+		::free(it->second);
+		g_guest_env.erase(it);
+	}
 	return 0;
 }
 
@@ -750,6 +812,30 @@ char* KYTY_SYSV_ABI strstr(const char* haystack, const char* needle) {
 	return const_cast<char*>(::strstr(haystack, needle));
 }
 
+char* KYTY_SYSV_ABI strdup_hle(const char* s) {
+	PRINT_NAME();
+	static int log_count = 0;
+	if (log_count++ < 64) {
+		LOGF("\t strdup src = %s\n", s != nullptr ? s : "<null>");
+	}
+	if (s == nullptr) {
+		// POSIX leaves strdup(NULL) undefined. RetroArch inserts the result into
+		// an FNV string map without a NULL check; return an allocated "" so boot
+		// can proceed past the NULL deref at guest pc ~0x900852fbb.
+		LOGF("\t strdup(NULL) -> allocated empty string\n");
+		char* empty = ::strdup("");
+		if (empty == nullptr) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		}
+		return empty;
+	}
+	char* copy = ::strdup(s);
+	if (copy == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+	}
+	return copy;
+}
+
 long KYTY_SYSV_ABI strtol(const char* str, char** endptr, int base) {
 	static int log_count = 0;
 	if (log_count++ < 16) {
@@ -815,6 +901,46 @@ int KYTY_SYSV_ABI LibcHeapErrorReportForGame(uint64_t msp, uint64_t ptr, uint64_
 	return 0;
 }
 
+// FreeBSD/Orbis libgen: may mutate path and return a pointer into it.
+// Guard NULL/empty like the title's own trampolines (return ".").
+static KYTY_SYSV_ABI char* basename_hle(char* path) {
+	PRINT_NAME();
+	LOGF("\t basename path = %s\n", path != nullptr ? path : "<null>");
+	if (path == nullptr || path[0] == '\0') {
+		return const_cast<char*>(".");
+	}
+	return ::basename(path);
+}
+
+static KYTY_SYSV_ABI char* dirname_hle(char* path) {
+	PRINT_NAME();
+	LOGF("\t dirname path = %s\n", path != nullptr ? path : "<null>");
+	if (path == nullptr || path[0] == '\0') {
+		return const_cast<char*>(".");
+	}
+	return ::dirname(path);
+}
+
+static KYTY_SYSV_ABI void* memrchr_hle(const void* s, int c, size_t n) {
+	return const_cast<void*>(::memrchr(s, c, n));
+}
+
+static KYTY_SYSV_ABI char* strcasestr_hle(const char* haystack, const char* needle) {
+	PRINT_NAME();
+	if (haystack == nullptr || needle == nullptr) {
+		return nullptr;
+	}
+	return const_cast<char*>(::strcasestr(haystack, needle));
+}
+
+static KYTY_SYSV_ABI void srandom_hle(unsigned seed) {
+	::srandom(seed);
+}
+
+static KYTY_SYSV_ABI long random_hle() {
+	return ::random();
+}
+
 // Guest struct option matches Linux/FreeBSD LP64 layout.
 struct GuestOption {
 	const char* name;
@@ -867,6 +993,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
 	LIB_FUNC("9yDWMxEFdJU", LibcInternal::strrchr);
 	LIB_FUNC("viiwFMaNamA", LibcInternal::strstr);
+	LIB_FUNC("g7zzzLDYGw0", LibcInternal::strdup_hle); // strdup
 	LIB_FUNC("mXlxhmLNMPg", LibcInternal::strtol);
 	LIB_FUNC("QxmSHBCuKTk", LibcInternal::strtoul);
 	LIB_FUNC("zlfEH8FmyUA", LibcInternal::strtoul);
@@ -887,6 +1014,13 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
 	LIB_FUNC("8VVXJxB5nlk", LibcInternal::getopt_long); // getopt_long
 	LIB_FUNC("smbQukfxYJM", LibC::getenv);              // getenv
+	LIB_FUNC("CRJcH8CnPSI", LibC::unsetenv);            // unsetenv
+	LIB_FUNC("rg5JEBlKCuo", LibcInternal::basename_hle); // basename
+	LIB_FUNC("E4wZaG1zSFc", LibcInternal::dirname_hle);  // dirname
+	LIB_FUNC("5G2ONUzRgjY", LibcInternal::memrchr_hle);  // memrchr
+	LIB_FUNC("eDmbt0P120g", LibcInternal::strcasestr_hle); // strcasestr
+	LIB_FUNC("w1o05aHJT4c", LibcInternal::random_hle);   // random
+	LIB_FUNC("sPC7XE6hfFY", LibcInternal::srandom_hle);  // srandom
 }
 
 } // namespace LibcInternal
@@ -907,6 +1041,8 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("YQ0navp+YIc", LibC::puts);
 	LIB_FUNC("M4YYbSFfJ8g", LibC::setenv);
 	LIB_FUNC("smbQukfxYJM", LibC::getenv);
+	LIB_FUNC("CRJcH8CnPSI", LibC::unsetenv);
+	LIB_FUNC("g7zzzLDYGw0", LibcInternal::strdup_hle); // strdup
 	LIB_FUNC("wLlFkwG9UcQ", LibC::libc_time);
 	LIB_FUNC("-VVn74ZyhEs", LibC::libc_difftime);
 	LIB_FUNC("1mecP7RgI2A", LibC::libc_gmtime);
