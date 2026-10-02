@@ -1438,6 +1438,22 @@ char* KYTY_SYSV_ABI strstr(const char* haystack, const char* needle) {
 	return const_cast<char*>(::strstr(haystack, needle));
 }
 
+
+static KYTY_SYSV_ABI char* strtok_hle(char* str, const char* delim) {
+	// libc.prx exports strtok as xor-eax-eax;ret. RetroArch nested_list /
+	// string_split use strtok_r; keep strtok covered the same way.
+	return ::strtok(str, delim);
+}
+
+static KYTY_SYSV_ABI char* strtok_r_hle(char* str, const char* delim, char** saveptr) {
+	// Critical for RetroArch core_option_manager: nested_list_add_item ->
+	// string_split_noalloc -> strtok_r. Without HLE under "libc", exact resolve
+	// binds the libc.prx null stub, nested_list_add_item fails, core_options
+	// stays NULL, GET_VARIABLE returns true with value=NULL, and fceumm does
+	// strcmp(NULL, "disabled") on fceumm_apu_*.
+	return ::strtok_r(str, delim, saveptr);
+}
+
 char* KYTY_SYSV_ABI strdup_hle(const char* s) {
 	PRINT_NAME();
 	static int log_count = 0;
@@ -1665,6 +1681,8 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
 	LIB_FUNC("9yDWMxEFdJU", LibcInternal::strrchr);
 	LIB_FUNC("viiwFMaNamA", LibcInternal::strstr);
+	LIB_FUNC("oVkZ8W8-Q8A", LibcInternal::strtok_hle);   // strtok
+	LIB_FUNC("enqPGLfmVNU", LibcInternal::strtok_r_hle); // strtok_r
 	LIB_FUNC("g7zzzLDYGw0", LibcInternal::strdup_hle); // strdup
 	LIB_FUNC("mXlxhmLNMPg", LibcInternal::strtol);
 	LIB_FUNC("QxmSHBCuKTk", LibcInternal::strtoul);
@@ -1738,6 +1756,8 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
 	LIB_FUNC("9yDWMxEFdJU", LibcInternal::strrchr);
 	LIB_FUNC("viiwFMaNamA", LibcInternal::strstr);
+	LIB_FUNC("oVkZ8W8-Q8A", LibcInternal::strtok_hle);   // strtok (override libc.prx)
+	LIB_FUNC("enqPGLfmVNU", LibcInternal::strtok_r_hle); // strtok_r (override libc.prx)
 	LIB_FUNC("xeYO4u7uyJ0", LibcInternal::fopen_hle);
 	LIB_FUNC("gkWgn0p1AfU", LibcInternal::freopen_hle);
 	LIB_FUNC("qdlHjTa9hQ4", LibcInternal::fdopen_hle);
