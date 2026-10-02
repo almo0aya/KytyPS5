@@ -20,11 +20,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <getopt.h>
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -313,6 +315,50 @@ static KYTY_SYSV_ABI int puts(const char* s) {
 	return GetGuestPrintfStdFunc()("%s\n", s);
 }
 
+// Guest-only environment (do not touch host environ).
+static std::unordered_map<std::string, std::string> g_guest_env = {
+    {"HOME", "/app0"},
+    {"USER", "kyty"},
+    {"TMPDIR", "/temp0"},
+    {"TMP", "/temp0"},
+    {"TEMP", "/temp0"},
+};
+
+static const char* FindEnvInEnvp(const char* name) {
+	if (g_envp == nullptr || name == nullptr) {
+		return nullptr;
+	}
+	const auto name_len = std::strlen(name);
+	for (const char* const* ep = g_envp; *ep != nullptr; ++ep) {
+		const char* entry = *ep;
+		if (std::strncmp(entry, name, name_len) == 0 && entry[name_len] == '=') {
+			return entry + name_len + 1;
+		}
+	}
+	return nullptr;
+}
+
+static KYTY_SYSV_ABI char* getenv(const char* name) {
+	PRINT_NAME();
+
+	LOGF("\t getenv name = %s\n", name != nullptr ? name : "<null>");
+
+	if (name == nullptr || name[0] == '\0') {
+		return nullptr;
+	}
+
+	if (const auto it = g_guest_env.find(name); it != g_guest_env.end()) {
+		return const_cast<char*>(it->second.c_str());
+	}
+
+	if (const char* from_envp = FindEnvInEnvp(name); from_envp != nullptr) {
+		return const_cast<char*>(from_envp);
+	}
+
+	// Not found — NULL is the correct POSIX result (not a crash).
+	return nullptr;
+}
+
 static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwrite) {
 	PRINT_NAME();
 
@@ -328,6 +374,10 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 	}
 
 	// Guest environment changes must not leak into emulator host libraries.
+	if (!overwrite && g_guest_env.find(name) != g_guest_env.end()) {
+		return 0;
+	}
+	g_guest_env[name] = value;
 	return 0;
 }
 
@@ -765,11 +815,42 @@ int KYTY_SYSV_ABI LibcHeapErrorReportForGame(uint64_t msp, uint64_t ptr, uint64_
 	return 0;
 }
 
+// Guest struct option matches Linux/FreeBSD LP64 layout.
+struct GuestOption {
+	const char* name;
+	int         has_arg;
+	int*        flag;
+	int         val;
+};
+
+int KYTY_SYSV_ABI getopt_long(int argc, char* const* argv, const char* optstring,
+                              const GuestOption* longopts, int* longindex) {
+	PRINT_NAME();
+
+	LOGF("\t getopt_long argc=%d optind=%d optstring=%s\n", argc, ::optind,
+	     optstring != nullptr ? optstring : "<null>");
+
+	if (argv == nullptr || optstring == nullptr || argc <= 0) {
+		return -1;
+	}
+	if (::optind <= 0) {
+		::optind = 1;
+	}
+
+	// Host struct option is ABI-compatible with GuestOption on LP64.
+	return ::getopt_long(argc, const_cast<char**>(argv), optstring,
+	                     reinterpret_cast<const struct option*>(longopts), longindex);
+}
+
 LIB_DEFINE(InitLibcInternal_1) {
 	LibcInternalExt::InitLibcInternalExt_1(s);
 
 	LIB_OBJECT("ZT4ODD2Ts9o", &LibcInternal::g_need_flag);
 	LIB_OBJECT("2sWzhYqFH4E", stdout);
+	LIB_OBJECT("zG0BNJOZdm4", &::optarg);   // optarg
+	LIB_OBJECT("zCnSJWp-Qj8", &::optind);   // optind
+	LIB_OBJECT("yaFXXViLWPw", &::opterr);   // opterr
+	LIB_OBJECT("FwzVaZ8Vnus", &::optopt);   // optopt
 
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
 	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
@@ -804,6 +885,8 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 
 	LIB_FUNC("al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
+	LIB_FUNC("8VVXJxB5nlk", LibcInternal::getopt_long); // getopt_long
+	LIB_FUNC("smbQukfxYJM", LibC::getenv);              // getenv
 }
 
 } // namespace LibcInternal
@@ -823,6 +906,7 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("hcuQgD53UxM", LibC::libc_printf);
 	LIB_FUNC("YQ0navp+YIc", LibC::puts);
 	LIB_FUNC("M4YYbSFfJ8g", LibC::setenv);
+	LIB_FUNC("smbQukfxYJM", LibC::getenv);
 	LIB_FUNC("wLlFkwG9UcQ", LibC::libc_time);
 	LIB_FUNC("-VVn74ZyhEs", LibC::libc_difftime);
 	LIB_FUNC("1mecP7RgI2A", LibC::libc_gmtime);

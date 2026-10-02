@@ -468,6 +468,29 @@ static KYTY_SYSV_ABI void stack_chk_fail() {
 	EXIT("stack fail!!!");
 }
 
+// Orbis sigset_t is 4x uint32_t (16 bytes).
+static KYTY_SYSV_ABI int KernelSigemptyset(void* set) {
+	PRINT_NAME();
+	if (set == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	std::memset(set, 0, 16);
+	return 0;
+}
+
+static KYTY_SYSV_ABI int KernelSigaction(int signum, const void* act, void* oldact) {
+	PRINT_NAME();
+	LOGF("\t sigaction signum=%d act=%p oldact=%p\n", signum, act, oldact);
+	// Minimal HLE: report success and clear oldact so callers do not read garbage.
+	if (oldact != nullptr) {
+		std::memset(oldact, 0, 32); // Orbis struct sigaction is typically 32 bytes
+	}
+	(void)signum;
+	(void)act;
+	return 0;
+}
+
 static KYTY_SYSV_ABI int sigprocmask(int /*how*/, const void* /*set*/, void* /*oset*/) {
 	// PRINT_NAME();
 
@@ -999,7 +1022,7 @@ static bool EnsureHostSignalDispatchInstalled() {
 	static const bool installed = [] {
 		struct sigaction action {};
 		action.sa_sigaction = HostSignalDispatchHandler;
-		sigemptyset(&action.sa_mask);
+		::sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
 		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
 	}();
@@ -1980,6 +2003,19 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI getdents(int fd, char* buf, int nbytes) {
+	PRINT_NAME();
+
+	return POSIX_N_CALL(LibKernel::FileSystem::KernelGetdents(fd, buf, nbytes));
+}
+
+int KYTY_SYSV_ABI getdirentries(int fd, char* buf, int nbytes, long* basep) {
+	PRINT_NAME();
+
+	return POSIX_N_CALL(LibKernel::FileSystem::KernelGetdirentries(
+	    fd, buf, nbytes, reinterpret_cast<int64_t*>(basep)));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2198,6 +2234,10 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("euKRgm0Vn2M", Posix::pthread_attr_setschedparam);
 	LIB_FUNC("7ZlAakEf0Qg", Posix::pthread_attr_setinheritsched);
 	LIB_FUNC("0qOtCR-ZHck", Posix::pthread_attr_getstacksize);
+	LIB_FUNC("DxmIMUQ-wXY", Posix::pthread_attr_getstackaddr);
+	LIB_FUNC("oLjPqUKhzes", Posix::pthread_attr_getinheritsched);
+	LIB_FUNC("e2G+cdEkOmU", Posix::pthread_attr_getscope);
+	LIB_FUNC("xesmlSI-KCI", Posix::pthread_attr_setscope);
 	LIB_FUNC("VUT1ZSrHT0I", Posix::pthread_attr_getdetachstate);
 	LIB_FUNC("JKyG3SWyA10", Posix::pthread_attr_setguardsize);
 	LIB_FUNC("JNkVVsVDmOk", Posix::pthread_attr_getguardsize);
@@ -2247,6 +2287,9 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("4n51s0zEf0c", Posix::inet_pton);
 	LIB_FUNC("5jRCs2axtr4", Posix::inet_ntop);
 	LIB_FUNC("cfwBSQyr5Ys", cfwBSQyr5Ys);
+	// posix getdents / getdirentries (RetroArch dir enumeration)
+	LIB_FUNC("2G6i6hMIUUY", Posix::getdents);
+	LIB_FUNC("sfKygSjIbI8", Posix::getdirentries);
 }
 
 } // namespace Posix
@@ -3089,6 +3132,9 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);
 	LIB_FUNC("oib76F-12fk", FileSystem::KernelLseek);
 	LIB_FUNC("j2AIqSqJP0w", FileSystem::KernelGetdents);
+	// posix getdents / _getdirentries: return -1+errno (not SCE error codes)
+	LIB_FUNC("2G6i6hMIUUY", Posix::getdents);
+	LIB_FUNC("sfKygSjIbI8", Posix::getdirentries);
 	LIB_FUNC("1-LFLmRFxxM", FileSystem::KernelMkdir);
 	LIB_FUNC("naInUjYt3so", FileSystem::KernelRmdir);
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
@@ -3227,6 +3273,12 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("JaRMy+QcpeU", LibKernel::PthreadAttrGetdetachstate);
 	LIB_FUNC("-quPa4SEJUw", LibKernel::PthreadAttrGetstack);
 	LIB_FUNC("Ru36fiTtJzA", LibKernel::PthreadAttrGetstackaddr);
+	LIB_FUNC("DxmIMUQ-wXY", Posix::pthread_attr_getstackaddr); // posix
+	LIB_FUNC("oLjPqUKhzes", Posix::pthread_attr_getinheritsched);
+	LIB_FUNC("e2G+cdEkOmU", Posix::pthread_attr_getscope);
+	LIB_FUNC("xesmlSI-KCI", Posix::pthread_attr_setscope);
+	LIB_FUNC("+F7C-hdk7+E", LibKernel::KernelSigemptyset);
+	LIB_FUNC("KiJEPEWRyUY", LibKernel::KernelSigaction);
 	LIB_FUNC("-fA+7ZlGDQs", LibKernel::PthreadAttrGetstacksize);
 	LIB_FUNC("txHtngJ+eyc", LibKernel::PthreadAttrGetguardsize);
 	LIB_FUNC("9RnL-m0+diQ", LibKernel::PthreadAttrGetsolosched);
@@ -3347,6 +3399,8 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);
 	LIB_FUNC("6xVpy0Fdq+I", LibKernel::sigprocmask);
+	LIB_FUNC("+F7C-hdk7+E", LibKernel::KernelSigemptyset);
+	LIB_FUNC("KiJEPEWRyUY", LibKernel::KernelSigaction);
 	LIB_FUNC("6Z83sYWFlA8", LibKernel::exit);
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);

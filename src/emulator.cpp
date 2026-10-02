@@ -85,6 +85,9 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
+	// Empty USB / media mounts used by RetroArch and other homebrew.
+	MountOrCreateDir("_Mnt", "/mnt");
+	MountOrCreateDir("_Mnt/usb0", "/mnt/usb0");
 }
 
 static bool ClearDirectoryContents(const std::filesystem::path& dir) {

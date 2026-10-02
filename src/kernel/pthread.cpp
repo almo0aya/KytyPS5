@@ -4177,6 +4177,34 @@ int KYTY_SYSV_ABI pthread_attr_getstacksize(const LibKernel::PthreadAttr* attr,
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrGetstacksize(attr, stack_size));
 }
 
+int KYTY_SYSV_ABI pthread_attr_getstackaddr(const LibKernel::PthreadAttr* attr,
+                                            void**                        stack_addr) {
+	// PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrGetstackaddr(attr, stack_addr));
+}
+
+int KYTY_SYSV_ABI pthread_attr_getscope(const LibKernel::PthreadAttr* /*attr*/, int* scope) {
+	// PRINT_NAME();
+	// Orbis only supports PTHREAD_SCOPE_SYSTEM (0).
+	if (scope == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	*scope = 0;
+	return 0;
+}
+
+int KYTY_SYSV_ABI pthread_attr_setscope(LibKernel::PthreadAttr* /*attr*/, int scope) {
+	// PRINT_NAME();
+	// Accept SYSTEM (0); reject PROCESS (1).
+	if (scope != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	return 0;
+}
+
 int KYTY_SYSV_ABI pthread_attr_setdetachstate(LibKernel::PthreadAttr* attr, int state) {
 	// PRINT_NAME();
 
