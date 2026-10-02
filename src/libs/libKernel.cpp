@@ -2016,6 +2016,60 @@ int KYTY_SYSV_ABI getdirentries(int fd, char* buf, int nbytes, long* basep) {
 	    fd, buf, nbytes, reinterpret_cast<int64_t*>(basep)));
 }
 
+int KYTY_SYSV_ABI chdir(const char* path) {
+	PRINT_NAME();
+	LOGF("\t chdir path = %s\n", path != nullptr ? path : "<null>");
+	// Guest paths are typically absolute (/app0/...). Accept and no-op.
+	if (path == nullptr) {
+		*GetErrorAddr() = POSIX_EINVAL;
+		return -1;
+	}
+	return 0;
+}
+
+// FreeBSD/Orbis mmap flags (subset).
+constexpr int POSIX_MAP_FIXED = 0x0010;
+constexpr int POSIX_MAP_ANON  = 0x1000;
+constexpr int POSIX_MAP_ANONYMOUS = POSIX_MAP_ANON;
+
+void* KYTY_SYSV_ABI mmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset) {
+	PRINT_NAME();
+	LOGF("\t mmap addr=%p len=0x%zx prot=%d flags=0x%x fd=%d offset=0x%llx\n", addr, len, prot,
+	     flags, fd, static_cast<unsigned long long>(offset));
+
+	if (len == 0) {
+		*GetErrorAddr() = POSIX_EINVAL;
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	}
+
+	// File-backed mmap is not needed for RetroArch boot; require anonymous.
+	if ((flags & POSIX_MAP_ANON) == 0 && fd >= 0) {
+		LOGF("\t mmap: file-backed mapping not implemented\n");
+		*GetErrorAddr() = POSIX_ENODEV;
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	}
+
+	void* out = addr;
+	const int kflags = flags & POSIX_MAP_FIXED;
+	const int result =
+	    LibKernel::Memory::KernelMapFlexibleMemory(&out, len, prot, kflags);
+	if (result != OK) {
+		*GetErrorAddr() = LibKernel::KernelToPosix(result);
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	}
+	LOGF("\t mmap -> %p\n", out);
+	return out;
+}
+
+int KYTY_SYSV_ABI madvise(void* addr, size_t len, int advice) {
+	PRINT_NAME();
+	LOGF("\t madvise addr=%p len=0x%zx advice=%d\n", addr, len, advice);
+	(void)addr;
+	(void)len;
+	(void)advice;
+	return 0;
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2290,6 +2344,9 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	// posix getdents / getdirentries (RetroArch dir enumeration)
 	LIB_FUNC("2G6i6hMIUUY", Posix::getdents);
 	LIB_FUNC("sfKygSjIbI8", Posix::getdirentries);
+	LIB_FUNC("6mMQ1MSPW-Q", Posix::chdir); // chdir
+	LIB_FUNC("BPE9s9vQQXo", Posix::mmap);  // mmap
+	LIB_FUNC("Jahsnh4KKkg", Posix::madvise); // madvise
 }
 
 } // namespace Posix
@@ -3135,6 +3192,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	// posix getdents / _getdirentries: return -1+errno (not SCE error codes)
 	LIB_FUNC("2G6i6hMIUUY", Posix::getdents);
 	LIB_FUNC("sfKygSjIbI8", Posix::getdirentries);
+	LIB_FUNC("6mMQ1MSPW-Q", Posix::chdir);
 	LIB_FUNC("1-LFLmRFxxM", FileSystem::KernelMkdir);
 	LIB_FUNC("naInUjYt3so", FileSystem::KernelRmdir);
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
