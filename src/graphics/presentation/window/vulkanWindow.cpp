@@ -232,6 +232,29 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
+		const bool soft_gpu_path =
+		    Config::AllowSoftwareGpu() ||
+		    device_properties.deviceType == vk::PhysicalDeviceType::eCpu;
+		if (soft_gpu_path) {
+			LOGF("Vulkan software-GPU path enabled for device %s "
+			     "(allow_software_gpu=%s deviceType=%s)\n",
+			     device_properties.deviceName.data(),
+			     Config::AllowSoftwareGpu() ? "true" : "false",
+			     vk::to_string(device_properties.deviceType).c_str());
+		}
+
+		const auto check_soft_feature = [&](vk::Bool32 supported, const char* name) {
+			if (supported == VK_TRUE) {
+				return;
+			}
+			if (soft_gpu_path) {
+				LOGF("WARNING: %s is not supported; continuing on software/CPU Vulkan path\n",
+				     name);
+				return;
+			}
+			reject(fmt::format("{} is not supported", name));
+		};
+
 #if defined(__APPLE__)
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
@@ -239,7 +262,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
 #endif
-		check_feature(image_view_min_lod.minLod, "image view minLod");
+		check_soft_feature(image_view_min_lod.minLod, "image view minLod");
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -251,7 +274,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 #if !defined(__APPLE__)
 		check_feature(device_features2.features.depthClamp, "depthClamp");
-		check_feature(fragment_barycentric.fragmentShaderBarycentric, "fragmentShaderBarycentric");
+		check_soft_feature(fragment_barycentric.fragmentShaderBarycentric,
+		                   "fragmentShaderBarycentric");
 #endif
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
@@ -288,7 +312,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("depthBounds is not supported\n");
 		}
 #else
-		check_feature(device_features2.features.depthBounds, "depthBounds");
+		check_soft_feature(device_features2.features.depthBounds, "depthBounds");
 #endif
 		check_feature(device_features2.features.shaderStorageImageWriteWithoutFormat,
 		              "shaderStorageImageWriteWithoutFormat");
@@ -308,9 +332,22 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
 
 			for (const char* ext: device_extensions) {
-				if (!HasExtension(available_extensions, ext)) {
-					reject(fmt::format("{} is not supported", ext));
+				if (HasExtension(available_extensions, ext)) {
+					continue;
 				}
+				const bool soft_optional_ext =
+				    soft_gpu_path &&
+				    (std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0
+#if !defined(__APPLE__)
+				     || std::strcmp(ext, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0
+#endif
+				    );
+				if (soft_optional_ext) {
+					LOGF("WARNING: %s is not supported; continuing on software/CPU Vulkan path\n",
+					     ext);
+					continue;
+				}
+				reject(fmt::format("{} is not supported", ext));
 			}
 
 			if (skip_device) {
@@ -401,6 +438,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
 
+	const bool min_lod_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+#if !defined(__APPLE__)
+	const bool barycentric_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+#endif
+
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
 
@@ -410,14 +454,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
-	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
+	// clipping and static color-write masks). Soft-optional on software/CPU devices too.
+	if (min_lod_ext_enabled) {
+		depth_clip_control.pNext = &image_view_min_lod;
 #if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
+		image_view_min_lod.pNext = &depth_clip_enable;
 #endif
+	} else {
+#if !defined(__APPLE__)
+		depth_clip_control.pNext = &depth_clip_enable;
+#endif
+	}
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	const bool workgroup_layout_extension =
@@ -467,8 +516,40 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+	if (min_lod_ext_enabled) {
+		supported_min_lod.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_min_lod;
+	}
+#if !defined(__APPLE__)
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_barycentric {};
+	if (barycentric_ext_enabled) {
+		supported_barycentric.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_barycentric;
+	}
+#endif
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+
+	graphics.image_view_min_lod_enabled =
+	    min_lod_ext_enabled && supported_min_lod.minLod == VK_TRUE;
+	if (graphics.image_view_min_lod_enabled) {
+		image_view_min_lod.minLod = VK_TRUE;
+	}
+#if !defined(__APPLE__)
+	graphics.fragment_shader_barycentric_enabled =
+	    barycentric_ext_enabled &&
+	    supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
+#endif
+	graphics.depth_bounds_enabled = supported_features2.features.depthBounds == VK_TRUE;
+	LOGF("Vulkan soft features: minLod=%s barycentric=%s depthBounds=%s\n",
+	     graphics.image_view_min_lod_enabled ? "true" : "false",
+#if defined(__APPLE__)
+	     "n/a",
+#else
+	     graphics.fragment_shader_barycentric_enabled ? "true" : "false",
+#endif
+	     graphics.depth_bounds_enabled ? "true" : "false");
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -540,7 +621,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
-	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
+	device_features.depthBounds = graphics.depth_bounds_enabled ? VK_TRUE : VK_FALSE;
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
@@ -573,9 +654,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.pNext = &features12;
 #else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-	fragment_barycentric.pNext                     = &features12;
-	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext                              = &fragment_barycentric;
+	if (graphics.fragment_shader_barycentric_enabled) {
+		fragment_barycentric.pNext                     = &features12;
+		fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
+		robustness2.pNext                              = &fragment_barycentric;
+	} else {
+		robustness2.pNext = &features12;
+	}
 #endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
@@ -588,8 +673,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
 	                                           : static_cast<void*>(&features12);
 #else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
+	if (robustness2_ext_enabled) {
+		features13.pNext = &robustness2;
+	} else if (graphics.fragment_shader_barycentric_enabled) {
+		features13.pNext = &fragment_barycentric;
+	} else {
+		features13.pNext = &features12;
+	}
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
@@ -976,6 +1066,30 @@ void WindowContext::CreateVulkan() {
 			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(
 			        nullptr, count, values);
 		    });
+
+		// Drop soft-optional extensions that the selected device lacks (software/CPU path).
+		device_extensions.erase(
+		    std::remove_if(device_extensions.begin(), device_extensions.end(),
+		                   [&](const char* ext) {
+			                   if (HasExtension(available_extensions, ext)) {
+				                   return false;
+			                   }
+			                   const bool soft_optional =
+			                       std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0
+#if !defined(__APPLE__)
+			                       || std::strcmp(ext,
+			                                      VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) ==
+			                           0
+#endif
+			                       ;
+			                   if (soft_optional) {
+				                   LOGF("Vulkan: omitting unsupported soft-optional extension %s\n",
+				                        ext);
+				                   return true;
+			                   }
+			                   return false;
+		                   }),
+		    device_extensions.end());
 
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
