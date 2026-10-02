@@ -1420,6 +1420,19 @@ static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
+	char preview[96] {};
+	if (path != nullptr) {
+		for (size_t i = 0; i < sizeof(preview) - 1; i++) {
+			const char c = path[i];
+			if (c == '\0') {
+				break;
+			}
+			preview[i] = (c >= 32 && c < 127) ? c : '?';
+		}
+	}
+	LOGF("\tposix open: ptr=%p preview=\"%s\" flags=%08x mode=%04x\n",
+	     static_cast<const void*>(path), path != nullptr ? preview : "<null>",
+	     static_cast<unsigned>(flags), static_cast<unsigned>(mode));
 	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, mode));
 }
 
@@ -3417,7 +3430,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("z0dtnPxYgtg", chmod);
 	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
-	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
+	LIB_FUNC("wuCroIGjt2g", LibKernel::open); // posix open
 	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
 	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);
 }

@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
@@ -19,7 +20,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <getopt.h>
 #include <libgen.h>
 #include <cstring>
@@ -745,12 +748,615 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 	return GetGuestSnprintfCtxFunc()(&ctx);
 }
 
+// Guest-path aware stdio. The title's sce_module/libc.prx is a loader companion
+// whose every FUNC export is `xor eax,eax; ret` (see tooling/native/libc_builder.cpp
+// VA 0x50). Eboot imports fopen/freopen/etc. from "libc", so without HLE under
+// that library name those calls always return NULL and KernelOpen never sees a
+// regular file. Resolve /app0/... through the mount table, then use host FILE*.
+
+static FILE* g_stdin_p  = stdin;
+static FILE* g_stdout_p = stdout;
+static FILE* g_stderr_p = stderr;
+
+static void SetErrnoFromHost() {
+	switch (errno) {
+		case ENOENT: *Posix::GetErrorAddr() = Posix::POSIX_ENOENT; break;
+		case EACCES: *Posix::GetErrorAddr() = Posix::POSIX_EACCES; break;
+		case EEXIST: *Posix::GetErrorAddr() = Posix::POSIX_EEXIST; break;
+		case EINVAL: *Posix::GetErrorAddr() = Posix::POSIX_EINVAL; break;
+		case EISDIR: *Posix::GetErrorAddr() = Posix::POSIX_EISDIR; break;
+		case ENOTDIR: *Posix::GetErrorAddr() = Posix::POSIX_ENOTDIR; break;
+		case EBADF: *Posix::GetErrorAddr() = Posix::POSIX_EBADF; break;
+		case ENOMEM: *Posix::GetErrorAddr() = Posix::POSIX_ENOMEM; break;
+		case EROFS: *Posix::GetErrorAddr() = Posix::POSIX_EROFS; break;
+		case EBUSY: *Posix::GetErrorAddr() = Posix::POSIX_EBUSY; break;
+		default: *Posix::GetErrorAddr() = Posix::POSIX_EIO; break;
+	}
+}
+
+static std::string ResolveGuestFilePath(const char* path) {
+	if (path == nullptr || path[0] == '\0') {
+		return {};
+	}
+	// Absolute host paths (rare) pass through; guest mounts go via /app0 etc.
+	if (path[0] == '/' && std::strncmp(path, "/app0", 5) != 0 && std::strncmp(path, "/hostapp", 8) != 0 &&
+	    std::strncmp(path, "/mnt", 4) != 0 && std::strncmp(path, "/download0", 10) != 0 &&
+	    std::strncmp(path, "/temp0", 6) != 0 && std::strncmp(path, "/data", 5) != 0 &&
+	    std::strncmp(path, "/usb", 4) != 0) {
+		return path;
+	}
+	const auto real = LibKernel::FileSystem::GetRealFilename(path);
+	if (real.empty()) {
+		return {};
+	}
+	return Common::PathToString(real);
+}
+
+static FILE* MapStdStream(FILE* stream) {
+	if (stream == nullptr) {
+		return nullptr;
+	}
+	if (stream == stdin || stream == g_stdin_p) {
+		return stdin;
+	}
+	if (stream == stdout || stream == g_stdout_p) {
+		return stdout;
+	}
+	if (stream == stderr || stream == g_stderr_p) {
+		return stderr;
+	}
+	return stream; // host FILE* from our fopen/freopen
+}
+
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
+	if (stream == nullptr) {
+		return ::fflush(nullptr);
+	}
+	FILE* host = MapStdStream(stream);
+	return ::fflush(host);
+}
 
-	return ::fflush(stream);
+static KYTY_SYSV_ABI void* malloc_hle(size_t size) {
+	PRINT_NAME();
+	if (size == 0) {
+		size = 1;
+	}
+	void* p = ::malloc(size);
+	if (p == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+	}
+	return p;
+}
+
+static KYTY_SYSV_ABI void* calloc_hle(size_t nmemb, size_t size) {
+	PRINT_NAME();
+	void* p = ::calloc(nmemb == 0 ? 1 : nmemb, size == 0 ? 1 : size);
+	if (p == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+	}
+	return p;
+}
+
+static KYTY_SYSV_ABI void* realloc_hle(void* ptr, size_t size) {
+	PRINT_NAME();
+	if (size == 0) {
+		::free(ptr);
+		return nullptr;
+	}
+	void* p = ::realloc(ptr, size);
+	if (p == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+	}
+	return p;
+}
+
+static KYTY_SYSV_ABI void free_hle(void* ptr) {
+	PRINT_NAME();
+	::free(ptr);
+}
+
+static KYTY_SYSV_ABI int posix_memalign_hle(void** memptr, size_t alignment, size_t size) {
+	PRINT_NAME();
+	if (memptr == nullptr) {
+		return Posix::POSIX_EINVAL;
+	}
+	if (alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) {
+		return Posix::POSIX_EINVAL;
+	}
+	if (size == 0) {
+		size = 1;
+	}
+	void* p = nullptr;
+	const int rc = ::posix_memalign(&p, alignment, size);
+	if (rc != 0) {
+		*Posix::GetErrorAddr() = rc;
+		*memptr = nullptr;
+		return rc;
+	}
+	*memptr = p;
+	return 0;
+}
+
+static KYTY_SYSV_ABI void* aligned_alloc_hle(size_t alignment, size_t size) {
+	PRINT_NAME();
+	void* p = nullptr;
+	if (posix_memalign_hle(&p, alignment, size) != 0) {
+		return nullptr;
+	}
+	return p;
+}
+
+static KYTY_SYSV_ABI FILE* fopen_hle(const char* path, const char* mode) {
+	PRINT_NAME();
+
+	if (path == nullptr || mode == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return nullptr;
+	}
+
+	const auto real = ResolveGuestFilePath(path);
+	if (real.empty()) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		LOGF_COLOR(Log::Color::Red, "\tfopen: %s [no mount]\n", path);
+		return nullptr;
+	}
+
+	FILE* file = ::fopen(real.c_str(), mode);
+	LOGF_COLOR(file != nullptr ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
+	           real.c_str(), file != nullptr ? "[ok]" : "[fail]");
+	if (file == nullptr) {
+		SetErrnoFromHost();
+	}
+	return file;
+}
+
+static KYTY_SYSV_ABI FILE* freopen_hle(const char* path, const char* mode, FILE* stream) {
+	PRINT_NAME();
+
+	if (path == nullptr || mode == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return nullptr;
+	}
+
+	const auto real = ResolveGuestFilePath(path);
+	if (real.empty()) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		LOGF_COLOR(Log::Color::Red, "\tfreopen: %s [no mount]\n", path);
+		return nullptr;
+	}
+
+	FILE* host = MapStdStream(stream);
+	// libc.prx exports zeroed FILE blobs; never pass those to host freopen.
+	if (host != stdin && host != stdout && host != stderr) {
+		host = (std::strpbrk(mode, "wa") != nullptr) ? stderr : stdin;
+		LOGF("\tfreopen: remapping foreign stream %p -> %s\n", static_cast<void*>(stream),
+		     host == stderr ? "stderr" : "stdin");
+	}
+
+	FILE* file = ::freopen(real.c_str(), mode, host);
+	LOGF_COLOR(file != nullptr ? Log::Color::Green : Log::Color::Red, "\tOpen: %s (freopen), %s\n",
+	           real.c_str(), file != nullptr ? "[ok]" : "[fail]");
+	if (file == nullptr) {
+		SetErrnoFromHost();
+		return nullptr;
+	}
+	if (host == stdin) {
+		g_stdin_p = file;
+	} else if (host == stdout) {
+		g_stdout_p = file;
+	} else if (host == stderr) {
+		g_stderr_p = file;
+	}
+	return file;
+}
+
+static KYTY_SYSV_ABI FILE* fdopen_hle(int fd, const char* mode) {
+	PRINT_NAME();
+	if (mode == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return nullptr;
+	}
+	// Kyty descriptors are not host fds; only allow stdio fds 0/1/2.
+	if (fd == 0) {
+		return stdin;
+	}
+	if (fd == 1) {
+		return stdout;
+	}
+	if (fd == 2) {
+		return stderr;
+	}
+	*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+	return nullptr;
+}
+
+static KYTY_SYSV_ABI int fclose_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return EOF;
+	}
+	FILE* host = MapStdStream(stream);
+	if (host == stdin || host == stdout || host == stderr) {
+		return 0; // do not close std streams
+	}
+	const int rc = ::fclose(host);
+	if (rc != 0) {
+		SetErrnoFromHost();
+	}
+	return rc;
+}
+
+static KYTY_SYSV_ABI size_t fread_hle(void* ptr, size_t size, size_t nmemb, FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return 0;
+	}
+	return ::fread(ptr, size, nmemb, MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI size_t fwrite_hle(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return 0;
+	}
+	return ::fwrite(ptr, size, nmemb, MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI int fseek_hle(FILE* stream, long offset, int whence) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	const int rc = ::fseek(MapStdStream(stream), offset, whence);
+	if (rc != 0) {
+		SetErrnoFromHost();
+	}
+	return rc;
+}
+
+static KYTY_SYSV_ABI long ftell_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	const long rc = ::ftell(MapStdStream(stream));
+	if (rc < 0) {
+		SetErrnoFromHost();
+	}
+	return rc;
+}
+
+static KYTY_SYSV_ABI int fseeko_hle(FILE* stream, int64_t offset, int whence) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	const int rc = ::fseeko(MapStdStream(stream), static_cast<off_t>(offset), whence);
+	if (rc != 0) {
+		SetErrnoFromHost();
+	}
+	return rc;
+}
+
+static KYTY_SYSV_ABI int64_t ftello_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	const off_t rc = ::ftello(MapStdStream(stream));
+	if (rc < 0) {
+		SetErrnoFromHost();
+	}
+	return static_cast<int64_t>(rc);
+}
+
+static KYTY_SYSV_ABI int fileno_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	FILE* host = MapStdStream(stream);
+	if (host == stdin) {
+		return 0;
+	}
+	if (host == stdout) {
+		return 1;
+	}
+	if (host == stderr) {
+		return 2;
+	}
+	const int fd = ::fileno(host);
+	if (fd < 0) {
+		SetErrnoFromHost();
+	}
+	return fd;
+}
+
+static KYTY_SYSV_ABI int feof_hle(FILE* stream) {
+	PRINT_NAME();
+	return stream == nullptr ? 0 : ::feof(MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI int ferror_hle(FILE* stream) {
+	PRINT_NAME();
+	return stream == nullptr ? 0 : ::ferror(MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI void clearerr_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream != nullptr) {
+		::clearerr(MapStdStream(stream));
+	}
+}
+
+static KYTY_SYSV_ABI int setvbuf_hle(FILE* stream, char* buf, int type, size_t size) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+	return ::setvbuf(MapStdStream(stream), buf, type, size);
+}
+
+static KYTY_SYSV_ABI void setbuf_hle(FILE* stream, char* buf) {
+	PRINT_NAME();
+	if (stream != nullptr) {
+		::setbuf(MapStdStream(stream), buf);
+	}
+}
+
+static KYTY_SYSV_ABI int ungetc_hle(int c, FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		return EOF;
+	}
+	return ::ungetc(c, MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI int fputs_hle(const char* s, FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return EOF;
+	}
+	return ::fputs(s != nullptr ? s : "", MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI int fputc_hle(int c, FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return EOF;
+	}
+	return ::fputc(c, MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI int fgetc_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return EOF;
+	}
+	return ::fgetc(MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI char* fgets_hle(char* s, int n, FILE* stream) {
+	PRINT_NAME();
+	if (s == nullptr || stream == nullptr || n <= 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return nullptr;
+	}
+	return ::fgets(s, n, MapStdStream(stream));
+}
+
+static KYTY_SYSV_ABI void rewind_hle(FILE* stream) {
+	PRINT_NAME();
+	if (stream != nullptr) {
+		::rewind(MapStdStream(stream));
+	}
+}
+
+static KYTY_SYSV_ABI int remove_hle(const char* path) {
+	PRINT_NAME();
+	if (path == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	const auto real = ResolveGuestFilePath(path);
+	if (real.empty()) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		LOGF_COLOR(Log::Color::Red, "\tremove: %s [no mount]\n", path);
+		return -1;
+	}
+	const int rc = ::remove(real.c_str());
+	LOGF_COLOR(rc == 0 ? Log::Color::Green : Log::Color::Red, "\tremove: %s, %s\n", real.c_str(),
+	           rc == 0 ? "[ok]" : "[fail]");
+	if (rc != 0) {
+		SetErrnoFromHost();
+	}
+	return rc;
+}
+
+// Minimal guest-va_list formatter for RetroArch/core-loader diagnostics.
+// Handles literal text plus %s/%d/%u/%zu/%p/%% — enough for fail() messages.
+static int FormatGuestPrintf(char* out, size_t out_size, const char* fmt, VaList* ap) {
+	if (out == nullptr || out_size == 0 || fmt == nullptr) {
+		return -1;
+	}
+	size_t o = 0;
+	auto append = [&](const char* s, size_t n) {
+		if (o + n >= out_size) {
+			n = (o < out_size) ? (out_size - 1 - o) : 0;
+		}
+		if (n > 0) {
+			std::memcpy(out + o, s, n);
+			o += n;
+		}
+	};
+	auto append_str = [&](const char* s) {
+		if (s == nullptr) {
+			s = "(null)";
+		}
+		append(s, std::strlen(s));
+	};
+
+	for (const char* p = fmt; *p != '\0'; ++p) {
+		if (*p != '%' || ap == nullptr) {
+			append(p, 1);
+			continue;
+		}
+		++p;
+		while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' || *p == '0') {
+			++p;
+		}
+		while (*p >= '0' && *p <= '9') {
+			++p;
+		}
+		if (*p == '.') {
+			++p;
+			while (*p >= '0' && *p <= '9') {
+				++p;
+			}
+		}
+		bool is_long = false;
+		bool is_size = false;
+		if (*p == 'l') {
+			is_long = true;
+			++p;
+			if (*p == 'l') {
+				++p;
+			}
+		} else if (*p == 'z') {
+			is_size = true;
+			++p;
+		} else if (*p == 'h') {
+			++p;
+			if (*p == 'h') {
+				++p;
+			}
+		}
+		char tmp[128];
+		switch (*p) {
+			case '%': append("%", 1); break;
+			case 's': append_str(VaArg_ptr<const char>(ap)); break;
+			case 'd':
+			case 'i': {
+				const long long v = is_long || is_size ? VaArg_long_long(ap) : VaArg_int(ap);
+				const int n       = std::snprintf(tmp, sizeof(tmp), "%lld", v);
+				if (n > 0) {
+					append(tmp, static_cast<size_t>(n));
+				}
+				break;
+			}
+			case 'u':
+			case 'x':
+			case 'X': {
+				const unsigned long long v =
+				    is_long || is_size ? static_cast<unsigned long long>(VaArg_long_long(ap))
+				                       : static_cast<unsigned long long>(VaArg_int(ap));
+				const int n = std::snprintf(tmp, sizeof(tmp), (*p == 'u') ? "%llu" : "%llx", v);
+				if (n > 0) {
+					append(tmp, static_cast<size_t>(n));
+				}
+				break;
+			}
+			case 'p': {
+				const auto* ptr = VaArg_ptr<const void>(ap);
+				const int   n   = std::snprintf(tmp, sizeof(tmp), "%p", ptr);
+				if (n > 0) {
+					append(tmp, static_cast<size_t>(n));
+				}
+				break;
+			}
+			case 'c': {
+				tmp[0] = static_cast<char>(VaArg_int(ap));
+				append(tmp, 1);
+				break;
+			}
+			case '\0':
+				--p;
+				break;
+			default: {
+				append("%", 1);
+				append(p, 1);
+				break;
+			}
+		}
+	}
+	out[o] = '\0';
+	return static_cast<int>(o);
+}
+
+static KYTY_SYSV_ABI int vsnprintf_hle(char* buf, size_t size, const char* fmt, VaList* ap) {
+	PRINT_NAME();
+	if (fmt == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	if (buf == nullptr || size == 0) {
+		char tmp[1];
+		return FormatGuestPrintf(tmp, sizeof(tmp), fmt, ap);
+	}
+	return FormatGuestPrintf(buf, size, fmt, ap);
+}
+
+static KYTY_SYSV_ABI int vsprintf_hle(char* buf, const char* fmt, VaList* ap) {
+	PRINT_NAME();
+	if (buf == nullptr || fmt == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	return FormatGuestPrintf(buf, 65536, fmt, ap);
+}
+
+static KYTY_SYSV_ABI int sprintf_hle(VA_ARGS) {
+	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
+	PRINT_NAME();
+	auto* buf = VaArg_ptr<char>(&ctx.va_list);
+	auto* fmt = VaArg_ptr<const char>(&ctx.va_list);
+	if (buf == nullptr || fmt == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	return FormatGuestPrintf(buf, 65536, fmt, &ctx.va_list);
+}
+
+static KYTY_SYSV_ABI int vfprintf_hle(FILE* stream, const char* fmt, VaList* ap) {
+	PRINT_NAME();
+	if (stream == nullptr || fmt == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	char      buf[1024];
+	const int n    = FormatGuestPrintf(buf, sizeof(buf), fmt, ap);
+	FILE*     host = MapStdStream(stream);
+	if (n < 0) {
+		return ::fputs(fmt, host) >= 0 ? static_cast<int>(std::strlen(fmt)) : -1;
+	}
+	LOGF("\tfprintf: %s", buf);
+	return ::fputs(buf, host) >= 0 ? n : -1;
+}
+
+static KYTY_SYSV_ABI int fprintf_hle(VA_ARGS) {
+	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
+	PRINT_NAME();
+	auto* stream = VaArg_ptr<FILE>(&ctx.va_list);
+	auto* fmt    = VaArg_ptr<const char>(&ctx.va_list);
+	if (stream == nullptr || fmt == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	return vfprintf_hle(stream, fmt, &ctx.va_list);
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -779,6 +1385,22 @@ int KYTY_SYSV_ABI strncmp(const char* s1, const char* s2, size_t n) {
 	return ::strncmp(s1, s2, n);
 }
 
+static KYTY_SYSV_ABI int strcasecmp_hle(const char* s1, const char* s2) {
+	return ::strcasecmp(s1, s2);
+}
+
+static KYTY_SYSV_ABI int strncasecmp_hle(const char* s1, const char* s2, size_t n) {
+	return ::strncasecmp(s1, s2, n);
+}
+
+static KYTY_SYSV_ABI int tolower_hle(int c) {
+	return ::tolower(c);
+}
+
+static KYTY_SYSV_ABI int toupper_hle(int c) {
+	return ::toupper(c);
+}
+
 size_t KYTY_SYSV_ABI strlen(const char* s) {
 	return ::strlen(s);
 }
@@ -793,6 +1415,10 @@ char* KYTY_SYSV_ABI strncpy(char* dest, const char* src, size_t count) {
 
 char* KYTY_SYSV_ABI strcat(char* dest, const char* src) {
 	return ::strcat(dest, src);
+}
+
+char* KYTY_SYSV_ABI strncat_hle(char* dest, const char* src, size_t n) {
+	return ::strncat(dest, src, n);
 }
 
 const char* KYTY_SYSV_ABI strchr(const char* s, int c) {
@@ -921,6 +1547,10 @@ static KYTY_SYSV_ABI char* dirname_hle(char* path) {
 	return ::dirname(path);
 }
 
+static KYTY_SYSV_ABI void* memchr_hle(const void* s, int c, size_t n) {
+	return const_cast<void*>(::memchr(s, c, n));
+}
+
 static KYTY_SYSV_ABI void* memrchr_hle(const void* s, int c, size_t n) {
 	return const_cast<void*>(::memrchr(s, c, n));
 }
@@ -980,16 +1610,58 @@ LIB_DEFINE(InitLibcInternal_1) {
 
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
 	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
+	LIB_FUNC("gQX+4GDQjpM", LibcInternal::malloc_hle);          // malloc
+	LIB_FUNC("2X5agFjKxMc", LibcInternal::calloc_hle);          // calloc
+	LIB_FUNC("Y7aJ1uydPMo", LibcInternal::realloc_hle);         // realloc
+	LIB_FUNC("tIhsqj0qsFE", LibcInternal::free_hle);            // free
+	LIB_FUNC("cVSk9y8URbc", LibcInternal::posix_memalign_hle);  // posix_memalign
+	LIB_FUNC("2Btkg8k24Zg", LibcInternal::aligned_alloc_hle);   // aligned_alloc
+	LIB_FUNC("Q2V+iqvjgC0", LibcInternal::vsnprintf_hle);       // vsnprintf
+	LIB_FUNC("jbz9I9vkqkk", LibcInternal::vsprintf_hle);        // vsprintf
+	LIB_FUNC("tcVi5SivF7Q", LibcInternal::sprintf_hle);         // sprintf
+	LIB_FUNC("xeYO4u7uyJ0", LibcInternal::fopen_hle);   // fopen
+	LIB_FUNC("gkWgn0p1AfU", LibcInternal::freopen_hle); // freopen
+	LIB_FUNC("qdlHjTa9hQ4", LibcInternal::fdopen_hle);  // fdopen
+	LIB_FUNC("uodLYyUip20", LibcInternal::fclose_hle);  // fclose
+	LIB_FUNC("lbB+UlZqVG0", LibcInternal::fread_hle);   // fread
+	LIB_FUNC("MpxhMh8QFro", LibcInternal::fwrite_hle);  // fwrite
+	LIB_FUNC("rQFVBXp-Cxg", LibcInternal::fseek_hle);   // fseek
+	LIB_FUNC("Qazy8LmXTvw", LibcInternal::ftell_hle);   // ftell
+	LIB_FUNC("pkYiKw09PRA", LibcInternal::fseeko_hle);  // fseeko
+	LIB_FUNC("5qP1iVQkdck", LibcInternal::ftello_hle);  // ftello
+	LIB_FUNC("Fm-dmyywH9Q", LibcInternal::fileno_hle);  // fileno
+	LIB_FUNC("LxcEU+ICu8U", LibcInternal::feof_hle);    // feof
+	LIB_FUNC("AHxyhN96dy4", LibcInternal::ferror_hle);  // ferror
+	LIB_FUNC("St9nbxSoezk", LibcInternal::clearerr_hle); // clearerr
+	LIB_FUNC("QMFyLoqNxIg", LibcInternal::setvbuf_hle); // setvbuf
+	LIB_FUNC("vZMcAfsA31I", LibcInternal::setbuf_hle);  // setbuf
+	LIB_FUNC("-LFO7jhD5CE", LibcInternal::ungetc_hle);  // ungetc
+	LIB_FUNC("QrZZdJ8XsX0", LibcInternal::fputs_hle);   // fputs
+	LIB_FUNC("aZK8lNei-Qw", LibcInternal::fputc_hle);   // fputc
+	LIB_FUNC("AEuF3F2f8TA", LibcInternal::fgetc_hle);   // fgetc
+	LIB_FUNC("KdP-nULpuGw", LibcInternal::fgets_hle);   // fgets
+	LIB_FUNC("3QIPIh-GDjw", LibcInternal::rewind_hle);  // rewind
+	LIB_FUNC("MZO7FXyAPU8", LibcInternal::remove_hle);  // remove
+	LIB_FUNC("fffwELXNVFA", LibcInternal::fprintf_hle); // fprintf
+	LIB_FUNC("pDBDcY6uLSA", LibcInternal::vfprintf_hle); // vfprintf
+	LIB_OBJECT("bgAcsbcEznc", &LibcInternal::g_stdin_p);  // __stdinp
+	LIB_OBJECT("zqJhBxAKfsc", &LibcInternal::g_stdout_p); // __stdoutp
+	LIB_OBJECT("as8Od-tH1BI", &LibcInternal::g_stderr_p); // __stderrp
 	LIB_FUNC("8zTFvBIAIN8", LibcInternal::memset);
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp); // strcmp
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp); // strncmp
+	LIB_FUNC("AV6ipCNa4Rw", LibcInternal::strcasecmp_hle); // strcasecmp
+	LIB_FUNC("pXvbDfchu6k", LibcInternal::strncasecmp_hle); // strncasecmp
+	LIB_FUNC("PqF+kHW-2WQ", LibcInternal::tolower_hle); // tolower
+	LIB_FUNC("TYE4irxSmko", LibcInternal::toupper_hle); // toupper
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
+	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy); // strcpy (was wrong NID 5Xa2ACNECdo)
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
+	LIB_FUNC("kHg45qPC6f0", LibcInternal::strncat_hle); // strncat
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
 	LIB_FUNC("9yDWMxEFdJU", LibcInternal::strrchr);
 	LIB_FUNC("viiwFMaNamA", LibcInternal::strstr);
@@ -1017,6 +1689,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("CRJcH8CnPSI", LibC::unsetenv);            // unsetenv
 	LIB_FUNC("rg5JEBlKCuo", LibcInternal::basename_hle); // basename
 	LIB_FUNC("E4wZaG1zSFc", LibcInternal::dirname_hle);  // dirname
+	LIB_FUNC("8u8lPzUEq+U", LibcInternal::memchr_hle);   // memchr
 	LIB_FUNC("5G2ONUzRgjY", LibcInternal::memrchr_hle);  // memrchr
 	LIB_FUNC("eDmbt0P120g", LibcInternal::strcasestr_hle); // strcasestr
 	LIB_FUNC("w1o05aHJT4c", LibcInternal::random_hle);   // random
@@ -1035,6 +1708,65 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("uMei1W9uyNo", LibC::exit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
 	LIB_FUNC("9BcDykPmo1I", LibC::libc_error);
+	// Override sce_module/libc.prx null stubs (xor eax,eax;ret) for RetroArch stdio/heap.
+	LIB_FUNC("gQX+4GDQjpM", LibcInternal::malloc_hle);
+	LIB_FUNC("2X5agFjKxMc", LibcInternal::calloc_hle);
+	LIB_FUNC("Y7aJ1uydPMo", LibcInternal::realloc_hle);
+	LIB_FUNC("tIhsqj0qsFE", LibcInternal::free_hle);
+	LIB_FUNC("cVSk9y8URbc", LibcInternal::posix_memalign_hle);
+	LIB_FUNC("2Btkg8k24Zg", LibcInternal::aligned_alloc_hle);
+	LIB_FUNC("Q2V+iqvjgC0", LibcInternal::vsnprintf_hle);
+	LIB_FUNC("jbz9I9vkqkk", LibcInternal::vsprintf_hle);
+	LIB_FUNC("tcVi5SivF7Q", LibcInternal::sprintf_hle);
+	LIB_FUNC("eLdDw6l0-bU", LibcInternal::snprintf);
+	LIB_FUNC("8zTFvBIAIN8", LibcInternal::memset);
+	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
+	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
+	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
+	LIB_FUNC("8u8lPzUEq+U", LibcInternal::memchr_hle);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp); // strcmp
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp); // strncmp
+	LIB_FUNC("AV6ipCNa4Rw", LibcInternal::strcasecmp_hle); // strcasecmp
+	LIB_FUNC("pXvbDfchu6k", LibcInternal::strncasecmp_hle); // strncasecmp
+	LIB_FUNC("PqF+kHW-2WQ", LibcInternal::tolower_hle); // tolower
+	LIB_FUNC("TYE4irxSmko", LibcInternal::toupper_hle); // toupper
+	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
+	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy);
+	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
+	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
+	LIB_FUNC("kHg45qPC6f0", LibcInternal::strncat_hle);
+	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);
+	LIB_FUNC("9yDWMxEFdJU", LibcInternal::strrchr);
+	LIB_FUNC("viiwFMaNamA", LibcInternal::strstr);
+	LIB_FUNC("xeYO4u7uyJ0", LibcInternal::fopen_hle);
+	LIB_FUNC("gkWgn0p1AfU", LibcInternal::freopen_hle);
+	LIB_FUNC("qdlHjTa9hQ4", LibcInternal::fdopen_hle);
+	LIB_FUNC("uodLYyUip20", LibcInternal::fclose_hle);
+	LIB_FUNC("lbB+UlZqVG0", LibcInternal::fread_hle);
+	LIB_FUNC("MpxhMh8QFro", LibcInternal::fwrite_hle);
+	LIB_FUNC("rQFVBXp-Cxg", LibcInternal::fseek_hle);
+	LIB_FUNC("Qazy8LmXTvw", LibcInternal::ftell_hle);
+	LIB_FUNC("pkYiKw09PRA", LibcInternal::fseeko_hle);
+	LIB_FUNC("5qP1iVQkdck", LibcInternal::ftello_hle);
+	LIB_FUNC("Fm-dmyywH9Q", LibcInternal::fileno_hle);
+	LIB_FUNC("LxcEU+ICu8U", LibcInternal::feof_hle);
+	LIB_FUNC("AHxyhN96dy4", LibcInternal::ferror_hle);
+	LIB_FUNC("St9nbxSoezk", LibcInternal::clearerr_hle);
+	LIB_FUNC("QMFyLoqNxIg", LibcInternal::setvbuf_hle);
+	LIB_FUNC("vZMcAfsA31I", LibcInternal::setbuf_hle);
+	LIB_FUNC("-LFO7jhD5CE", LibcInternal::ungetc_hle);
+	LIB_FUNC("QrZZdJ8XsX0", LibcInternal::fputs_hle);
+	LIB_FUNC("aZK8lNei-Qw", LibcInternal::fputc_hle);
+	LIB_FUNC("AEuF3F2f8TA", LibcInternal::fgetc_hle);
+	LIB_FUNC("KdP-nULpuGw", LibcInternal::fgets_hle);
+	LIB_FUNC("3QIPIh-GDjw", LibcInternal::rewind_hle);
+	LIB_FUNC("MZO7FXyAPU8", LibcInternal::remove_hle);
+	LIB_FUNC("fffwELXNVFA", LibcInternal::fprintf_hle);
+	LIB_FUNC("pDBDcY6uLSA", LibcInternal::vfprintf_hle);
+	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
+	LIB_OBJECT("bgAcsbcEznc", &LibcInternal::g_stdin_p);
+	LIB_OBJECT("zqJhBxAKfsc", &LibcInternal::g_stdout_p);
+	LIB_OBJECT("as8Od-tH1BI", &LibcInternal::g_stderr_p);
 	LIB_FUNC("bzQExy189ZI", LibC::init_env);
 	LIB_FUNC("8G2LB+A3rzg", LibC::atexit);
 	LIB_FUNC("hcuQgD53UxM", LibC::libc_printf);
