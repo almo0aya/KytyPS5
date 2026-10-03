@@ -2794,12 +2794,13 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t search_start = 0x%016" PRIx64 "\n"
-	     "\t search_end   = 0x%016" PRIx64 "\n"
-	     "\t len          = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n"
-	     "\t memory_type  = %d\n",
-	     search_start, search_end, len, alignment, memory_type);
+	// Orbis returns ENOMEM when the direct-memory pool cannot satisfy the request.
+	// Returning EAGAIN here made guests (PayloadSDK heap / RADV) spin forever on
+	// exhaustion — RetroArch+vulkan filled ~12.5 GiB as 16 MiB type-12 segments
+	// then hammered AllocateDirectMemory until OOM/timeout.
+	static uint64_t s_consecutive_fails = 0;
+	static size_t   s_last_fail_len     = 0;
+	static int      s_last_fail_type    = -1;
 
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
@@ -2813,12 +2814,56 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	                            : PhysicalMemory::AllocationKind::Direct;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type,
 	                              kind)) {
-		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
-		return KERNEL_ERROR_EAGAIN;
+		const bool same = (len == s_last_fail_len && memory_type == s_last_fail_type);
+		s_consecutive_fails = same ? s_consecutive_fails + 1 : 1;
+		s_last_fail_len     = len;
+		s_last_fail_type    = memory_type;
+		// Log the first few identical failures, then every 4096th, to keep runaway
+		// guest allocators from flooding the console (was ~850k lines / run).
+		const bool log_this = s_consecutive_fails <= 8 ||
+		                      (s_consecutive_fails & 0xfffu) == 0;
+		if (log_this) {
+			LOGF("\t search_start = 0x%016" PRIx64 "\n"
+			     "\t search_end   = 0x%016" PRIx64 "\n"
+			     "\t len          = 0x%016" PRIx64 "\n"
+			     "\t alignment    = 0x%016" PRIx64 "\n"
+			     "\t memory_type  = %d\n"
+			     "\t consecutive_fails = %" PRIu64 "\n",
+			     search_start, search_end, static_cast<uint64_t>(len),
+			     static_cast<uint64_t>(alignment), memory_type, s_consecutive_fails);
+			LOGF_COLOR(Log::Color::Red, "\t[Fail] (ENOMEM)\n");
+			if (s_consecutive_fails == 1) {
+				LOGF_COLOR(Log::Color::Yellow,
+				           "\t hint: DirectMemory exhausted; guest Vulkan/RADV or "
+				           "title heap may be runaway. Prefer video_driver=ps5 on "
+				           "software hosts.\n");
+			}
+		}
+		// Hard limit: guest spin-loops on ENOMEM (title heap / RADV) otherwise
+		// thrash until host OOM. Abort with a clear diagnosis instead.
+		if (s_consecutive_fails >= 16384) {
+			LOGF_COLOR(Log::Color::Red,
+			           "DirectMemory fail loop: %" PRIu64
+			           " consecutive ENOMEM (len=0x%zx type=%d). "
+			           "Aborting. On software GPUs set video_driver=ps5 "
+			           "(Vulkan/RADV path exhausts the 12.5 GiB pool as "
+			           "16 MiB heap segments).\n",
+			           s_consecutive_fails, len, memory_type);
+			EXIT("DirectMemory allocation fail loop (guest runaway)");
+		}
+		return KERNEL_ERROR_ENOMEM;
 	}
 
+	s_consecutive_fails = 0;
 	*phys_addr_out = static_cast<int64_t>(addr);
 
+	LOGF("\t search_start = 0x%016" PRIx64 "\n"
+	     "\t search_end   = 0x%016" PRIx64 "\n"
+	     "\t len          = 0x%016" PRIx64 "\n"
+	     "\t alignment    = 0x%016" PRIx64 "\n"
+	     "\t memory_type  = %d\n",
+	     search_start, search_end, static_cast<uint64_t>(len),
+	     static_cast<uint64_t>(alignment), memory_type);
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 
 	return OK;

@@ -2734,7 +2734,19 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
+	// Orbis/FreeBSD libthr: a null object is PTHREAD_COND_INITIALIZER, not an
+	// allocated cond. Destroying it allocates nothing and returns success.
+	// (A null cond pointer is still EINVAL above.) Do not fatal here: cores
+	// such as PPSSPP tear down static conds while loading.
+	if (*cond == nullptr) {
+		static std::atomic<int> logged {0};
+		if (logged.exchange(1, std::memory_order_relaxed) == 0) {
+			LOGF("pthread_cond_destroy: null object (PTHREAD_COND_INITIALIZER) at %p, "
+			     "returning 0\n",
+			     static_cast<void*>(cond));
+		}
+		return OK;
+	}
 
 	int result = 0;
 
@@ -4175,6 +4187,34 @@ int KYTY_SYSV_ABI pthread_attr_getstacksize(const LibKernel::PthreadAttr* attr,
 	// PRINT_NAME();
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrGetstacksize(attr, stack_size));
+}
+
+int KYTY_SYSV_ABI pthread_attr_getstackaddr(const LibKernel::PthreadAttr* attr,
+                                            void**                        stack_addr) {
+	// PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrGetstackaddr(attr, stack_addr));
+}
+
+int KYTY_SYSV_ABI pthread_attr_getscope(const LibKernel::PthreadAttr* /*attr*/, int* scope) {
+	// PRINT_NAME();
+	// Orbis only supports PTHREAD_SCOPE_SYSTEM (0).
+	if (scope == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	*scope = 0;
+	return 0;
+}
+
+int KYTY_SYSV_ABI pthread_attr_setscope(LibKernel::PthreadAttr* /*attr*/, int scope) {
+	// PRINT_NAME();
+	// Accept SYSTEM (0); reject PROCESS (1).
+	if (scope != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	return 0;
 }
 
 int KYTY_SYSV_ABI pthread_attr_setdetachstate(LibKernel::PthreadAttr* attr, int state) {

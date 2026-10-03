@@ -325,6 +325,25 @@ struct Label {
 	uint64_t          m_reserved[3];
 };
 
+int KYTY_SYSV_ABI SceAgcInit(uint32_t version) {
+	PRINT_NAME();
+	LOGF("\t sceAgcInit version = %u\n", version);
+	// PS5 RetroArch embeds RADV, which treats a 0 return as "GPU ready" and
+	// then grows the title heap by 16 MiB DirectMemory segments until the
+	// pool is empty (and retries forever). On --allow-software-gpu there is
+	// no real AGC; fail so radv_ps5_platform_init() returns false.
+	if (Config::AllowSoftwareGpu()) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "\t sceAgcInit: refusing under --allow-software-gpu "
+		           "(avoid RADV DirectMemory thrash; use video_driver=ps5)\n");
+		return -1;
+	}
+	if (version > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
+		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", version);
+	}
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	PRINT_NAME();
 

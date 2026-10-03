@@ -189,9 +189,23 @@ LIB_DEFINE(InitAgcDriver_1) {
 
 } // namespace LibGen5Driver
 
+namespace LibAgc {
+
+LIB_VERSION("Agc", 1, "Agc", 1, 1);
+
+LIB_DEFINE(InitAgc_1) {
+	PRINT_NAME_ENABLE(true);
+	// Prospero sceAgcInit(uint32_t version) — was unresolved (stub→0), which
+	// made RADV believe the GPU was ready on software hosts.
+	LIB_FUNC("kW3GLb7QfPg", Graphics::Gen5::SceAgcInit);
+}
+
+} // namespace LibAgc
+
 LIB_DEFINE(InitAgcDriver_1) {
 	LibGen5::InitAgcDriver_1(s);
 	LibGen5Driver::InitAgcDriver_1(s);
+	LibAgc::InitAgc_1(s);
 }
 
 } // namespace Libs

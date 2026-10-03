@@ -37,14 +37,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
-#if defined(__APPLE__)
+#elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+// <ucontext.h> errors unless _XOPEN_SOURCE is set; the signal mcontext lives in sys/ucontext.h.
+#include <sys/ucontext.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
-#endif
 #endif
 
 namespace Libs::LibKernel {
@@ -676,6 +677,40 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+		// NULL call soft-continue: guest called through a NULL function pointer (unresolved
+		// font/FreeType/video font backend under XMB). Treat as a stub that returns 0/NULL so
+		// RetroArch can proceed on --allow-software-gpu (video_ps5) instead of aborting.
+		if (Config::AllowSoftwareGpu() && info->exception_address == 0 &&
+		    info->access_violation_vaddr == 0 && info->native_context != nullptr &&
+		    IsReadableRange(info->rsp, sizeof(uint64_t))) {
+			const auto ret = *reinterpret_cast<const uint64_t*>(info->rsp);
+#if defined(__APPLE__)
+			auto* uctx = static_cast<ucontext_t*>(info->native_context);
+			uctx->uc_mcontext->__ss.__rax = 0;
+			uctx->uc_mcontext->__ss.__rsp = static_cast<__uint64_t>(info->rsp + 8);
+			uctx->uc_mcontext->__ss.__rip = static_cast<__uint64_t>(ret);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// native_context is EXCEPTION_POINTERS::ContextRecord, not a POSIX ucontext.
+			auto* ctx = static_cast<CONTEXT*>(info->native_context);
+			ctx->Rax = 0;
+			ctx->Rsp = info->rsp + 8;
+			ctx->Rip = ret;
+#else
+			auto* uctx = static_cast<ucontext_t*>(info->native_context);
+			uctx->uc_mcontext.gregs[REG_RAX] = 0;
+			uctx->uc_mcontext.gregs[REG_RSP] = static_cast<greg_t>(info->rsp + 8);
+			uctx->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(ret);
+#endif
+			static std::atomic<int> null_calls{0};
+			const int n = null_calls.fetch_add(1) + 1;
+			if (n <= 8 || (n & 0xff) == 0) {
+				std::printf("NULL call soft-continue #%d: returning to 0x%016" PRIx64
+				            " rax=0 (allow-software-gpu)\n",
+				            n, ret);
+				std::fflush(stdout);
+			}
+			return true;
+		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -717,6 +752,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
 	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	return false;
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {

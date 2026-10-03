@@ -11,6 +11,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -85,6 +86,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --allow-software-gpu               Allow CPU/software Vulkan devices\n"
+	         "                                       (e.g. llvmpipe) with reduced features.\n"
+	         "                                       Also set by KYTY_ALLOW_SOFTWARE_GPU=1.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -229,6 +233,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--tessellation") {
 			options.config.tessellation_enabled = true;
+			continue;
+		}
+
+		if (arg == "--allow-software-gpu") {
+			options.config.allow_software_gpu = true;
 			continue;
 		}
 
@@ -461,6 +470,11 @@ static int Main(int argc, char* argv[]) {
 	if (show_help) {
 		PrintUsage();
 		return 0;
+	}
+
+	if (const char* env = std::getenv("KYTY_ALLOW_SOFTWARE_GPU");
+	    env != nullptr && env[0] != '\0' && env[0] != '0') {
+		options.config.allow_software_gpu = true;
 	}
 
 	Run(options);

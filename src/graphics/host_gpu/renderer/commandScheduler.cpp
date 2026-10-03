@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -182,7 +183,15 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
-	CheckActive();
+	// video_ps5 / Software present never begins a guest GPU command stream. Finish() can still
+	// be reached from VideoOut/HLE teardown; do not hard-exit under --allow-software-gpu.
+	if (!Active()) {
+		if (Config::AllowSoftwareGpu()) {
+			LOGF("CommandScheduler::Finish skipped (inactive, allow-software-gpu)\n");
+			return;
+		}
+		CheckActive();
+	}
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
@@ -226,7 +235,20 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
-	CheckActive();
+	if (!Active()) {
+		if (Config::AllowSoftwareGpu()) {
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				LOGF("CommandScheduler::DeferOperation run-inline (inactive, allow-software-gpu)\n");
+			}
+			if (operation) {
+				operation();
+			}
+			return;
+		}
+		CheckActive();
+	}
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
@@ -245,7 +267,20 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	CheckActive();
+	if (!Active()) {
+		if (Config::AllowSoftwareGpu()) {
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				LOGF("CommandScheduler::DeferPriorityOperation run-inline (inactive, allow-software-gpu)\n");
+			}
+			if (operation) {
+				operation();
+			}
+			return;
+		}
+		CheckActive();
+	}
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
