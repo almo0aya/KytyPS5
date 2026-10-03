@@ -23,8 +23,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <getopt.h>
 #include <libgen.h>
+#endif
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
@@ -33,6 +35,269 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The RetroArch HLE in this file calls POSIX libc that MSVC/clang-cl does not ship.
+// Linux and macOS keep the host implementations. These shims exist so the same
+// calls compile on Windows; getopt_long follows POSIX (it does not permute argv).
+
+static char* basename(char* path) {
+	if (path == nullptr || path[0] == '\0') {
+		return const_cast<char*>(".");
+	}
+	size_t len = std::strlen(path);
+	while (len > 1 && path[len - 1] == '/') {
+		path[--len] = '\0';
+	}
+	char* slash = std::strrchr(path, '/');
+	if (slash == nullptr) {
+		return path;
+	}
+	return slash[1] != '\0' ? slash + 1 : const_cast<char*>(".");
+}
+
+static char* dirname(char* path) {
+	if (path == nullptr || path[0] == '\0') {
+		return const_cast<char*>(".");
+	}
+	size_t len = std::strlen(path);
+	while (len > 1 && path[len - 1] == '/') {
+		path[--len] = '\0';
+	}
+	char* slash = std::strrchr(path, '/');
+	if (slash == nullptr) {
+		return const_cast<char*>(".");
+	}
+	if (slash == path) {
+		slash[1] = '\0';
+		return path;
+	}
+	*slash = '\0';
+	return path;
+}
+
+static int strcasecmp(const char* a, const char* b) {
+	return _stricmp(a, b);
+}
+
+static int strncasecmp(const char* a, const char* b, size_t n) {
+	return _strnicmp(a, b, n);
+}
+
+static char* strtok_r(char* str, const char* delim, char** saveptr) {
+	return strtok_s(str, delim, saveptr);
+}
+
+static char* strcasestr(const char* haystack, const char* needle) {
+	if (haystack == nullptr || needle == nullptr) {
+		return nullptr;
+	}
+	if (needle[0] == '\0') {
+		return const_cast<char*>(haystack);
+	}
+	for (const char* h = haystack; *h != '\0'; ++h) {
+		const char* a = h;
+		const char* b = needle;
+		while (*a != '\0' && *b != '\0' &&
+		       std::tolower(static_cast<unsigned char>(*a)) ==
+		           std::tolower(static_cast<unsigned char>(*b))) {
+			++a;
+			++b;
+		}
+		if (*b == '\0') {
+			return const_cast<char*>(h);
+		}
+	}
+	return nullptr;
+}
+
+static void srandom(unsigned seed) {
+	std::srand(seed);
+}
+
+static long random() {
+	return std::rand();
+}
+
+using off_t = long long;
+
+static int fseeko(FILE* stream, off_t offset, int whence) {
+	return _fseeki64(stream, offset, whence);
+}
+
+static off_t ftello(FILE* stream) {
+	return _ftelli64(stream);
+}
+
+struct option {
+	const char* name;
+	int         has_arg;
+	int*        flag;
+	int         val;
+};
+
+static char* optarg = nullptr;
+static int   optind = 1;
+static int   opterr = 1;
+static int   optopt = 0;
+
+static int getopt_long(int argc, char* const argv[], const char* optstring,
+                       const struct option* longopts, int* longindex) {
+	static const char* cursor       = nullptr;
+	static int         cursor_index = -1;
+
+	optarg = nullptr;
+	if (optind <= 0) {
+		optind       = 1;
+		cursor       = nullptr;
+		cursor_index = -1;
+	}
+	if (optstring == nullptr) {
+		optstring = "";
+	}
+	const bool  missing_colon = optstring[0] == ':';
+	const char* shorts        = optstring;
+	if (shorts[0] == '+' || shorts[0] == '-') {
+		++shorts;
+	}
+	if (shorts[0] == ':') {
+		++shorts;
+	}
+
+	if (cursor_index != optind) {
+		cursor       = nullptr;
+		cursor_index = -1;
+	}
+
+	if (cursor == nullptr) {
+		if (optind >= argc || argv[optind] == nullptr) {
+			return -1;
+		}
+		const char* arg = argv[optind];
+		if (arg[0] != '-' || arg[1] == '\0') {
+			return -1;
+		}
+		if (arg[1] == '-' && arg[2] == '\0') {
+			++optind;
+			return -1;
+		}
+		if (arg[1] == '-') {
+			const char* name    = arg + 2;
+			const char* eq      = std::strchr(name, '=');
+			const size_t namelen = eq != nullptr ? static_cast<size_t>(eq - name) : std::strlen(name);
+			const struct option* match       = nullptr;
+			int                  match_index = -1;
+			if (longopts != nullptr) {
+				for (int i = 0; longopts[i].name != nullptr; ++i) {
+					if (std::strncmp(longopts[i].name, name, namelen) == 0 &&
+					    longopts[i].name[namelen] == '\0') {
+						match       = &longopts[i];
+						match_index = i;
+						break;
+					}
+				}
+				if (match == nullptr && namelen > 0) {
+					int matches = 0;
+					for (int i = 0; longopts[i].name != nullptr; ++i) {
+						if (std::strncmp(longopts[i].name, name, namelen) == 0) {
+							match       = &longopts[i];
+							match_index = i;
+							++matches;
+						}
+					}
+					if (matches != 1) {
+						match = nullptr;
+					}
+				}
+			}
+			++optind;
+			if (match == nullptr) {
+				optopt = 0;
+				if (opterr != 0 && !missing_colon) {
+					std::fprintf(stderr, "%s: unrecognized option '--%.*s'\n",
+					             argv[0] != nullptr ? argv[0] : "", static_cast<int>(namelen), name);
+				}
+				return '?';
+			}
+			if (longindex != nullptr) {
+				*longindex = match_index;
+			}
+			if (match->has_arg == 1) {
+				if (eq != nullptr) {
+					optarg = const_cast<char*>(eq + 1);
+				} else if (optind < argc) {
+					optarg = argv[optind++];
+				} else {
+					optopt = match->val;
+					if (missing_colon) {
+						return ':';
+					}
+					if (opterr != 0) {
+						std::fprintf(stderr, "%s: option '--%s' requires an argument\n",
+						             argv[0] != nullptr ? argv[0] : "", match->name);
+					}
+					return '?';
+				}
+			} else if (match->has_arg == 2) {
+				if (eq != nullptr) {
+					optarg = const_cast<char*>(eq + 1);
+				}
+			} else if (eq != nullptr) {
+				if (opterr != 0 && !missing_colon) {
+					std::fprintf(stderr, "%s: option '--%s' doesn't allow an argument\n",
+					             argv[0] != nullptr ? argv[0] : "", match->name);
+				}
+				return '?';
+			}
+			if (match->flag != nullptr) {
+				*match->flag = match->val;
+				return 0;
+			}
+			return match->val;
+		}
+		cursor       = arg + 1;
+		cursor_index = optind;
+	}
+
+	const char c = *cursor++;
+	if (*cursor == '\0') {
+		cursor       = nullptr;
+		cursor_index = -1;
+		++optind;
+	}
+	const char* spec = std::strchr(shorts, c);
+	if (spec == nullptr || c == ':') {
+		optopt = static_cast<unsigned char>(c);
+		if (opterr != 0 && !missing_colon) {
+			std::fprintf(stderr, "%s: invalid option -- '%c'\n", argv[0] != nullptr ? argv[0] : "", c);
+		}
+		return '?';
+	}
+	if (spec[1] == ':') {
+		const bool optional = spec[2] == ':';
+		if (cursor != nullptr) {
+			optarg       = const_cast<char*>(cursor);
+			cursor       = nullptr;
+			cursor_index = -1;
+			++optind;
+		} else if (!optional && optind < argc) {
+			optarg = argv[optind++];
+		} else if (!optional) {
+			optopt = static_cast<unsigned char>(c);
+			if (missing_colon) {
+				return ':';
+			}
+			if (opterr != 0) {
+				std::fprintf(stderr, "%s: option requires an argument -- '%c'\n",
+				             argv[0] != nullptr ? argv[0] : "", c);
+			}
+			return '?';
+		}
+	}
+	return static_cast<unsigned char>(c);
+}
+#endif
 
 namespace Libs {
 
@@ -839,8 +1104,69 @@ static KYTY_SYSV_ABI void* calloc_hle(size_t nmemb, size_t size) {
 	return p;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct WinAlignedBlock {
+	void*  raw       = nullptr;
+	size_t size      = 0;
+	size_t alignment = 0;
+};
+
+std::mutex                                  g_win_aligned_mutex;
+std::unordered_map<void*, WinAlignedBlock>  g_win_aligned;
+
+static void* WinAlignPointer(void* raw, size_t alignment) {
+	const auto base = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+	const auto mask = static_cast<std::uintptr_t>(alignment) - 1;
+	return reinterpret_cast<void*>((base + mask) & ~mask);
+}
+
+static bool WinTakeAligned(void* ptr, WinAlignedBlock* out) {
+	std::lock_guard lock(g_win_aligned_mutex);
+	auto            it = g_win_aligned.find(ptr);
+	if (it == g_win_aligned.end()) {
+		return false;
+	}
+	*out = it->second;
+	g_win_aligned.erase(it);
+	return true;
+}
+#endif
+
 static KYTY_SYSV_ABI void* realloc_hle(void* ptr, size_t size) {
 	PRINT_NAME();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (ptr != nullptr) {
+		WinAlignedBlock block {};
+		if (WinTakeAligned(ptr, &block)) {
+			if (size == 0) {
+				::free(block.raw);
+				return nullptr;
+			}
+			const size_t extra = block.alignment - 1 + sizeof(void*);
+			if (size > static_cast<size_t>(-1) - extra) {
+				std::lock_guard lock(g_win_aligned_mutex);
+				g_win_aligned.insert_or_assign(ptr, block);
+				*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+				return nullptr;
+			}
+			void* raw = ::malloc(size + extra);
+			if (raw == nullptr) {
+				std::lock_guard lock(g_win_aligned_mutex);
+				g_win_aligned.insert_or_assign(ptr, block);
+				*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+				return nullptr;
+			}
+			void* next = WinAlignPointer(raw, block.alignment);
+			std::memcpy(next, ptr, std::min(block.size, size));
+			{
+				std::lock_guard lock(g_win_aligned_mutex);
+				g_win_aligned.insert_or_assign(next, WinAlignedBlock {raw, size, block.alignment});
+			}
+			::free(block.raw);
+			return next;
+		}
+	}
+#endif
 	if (size == 0) {
 		::free(ptr);
 		return nullptr;
@@ -854,6 +1180,15 @@ static KYTY_SYSV_ABI void* realloc_hle(void* ptr, size_t size) {
 
 static KYTY_SYSV_ABI void free_hle(void* ptr) {
 	PRINT_NAME();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (ptr != nullptr) {
+		WinAlignedBlock block {};
+		if (WinTakeAligned(ptr, &block)) {
+			::free(block.raw);
+			return;
+		}
+	}
+#endif
 	::free(ptr);
 }
 
@@ -868,6 +1203,29 @@ static KYTY_SYSV_ABI int posix_memalign_hle(void** memptr, size_t alignment, siz
 	if (size == 0) {
 		size = 1;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Over-allocate so the guest pointer is aligned and free_hle can recover the
+	// malloc base. ::free cannot release a _aligned_malloc pointer.
+	const size_t extra = alignment - 1 + sizeof(void*);
+	if (size > static_cast<size_t>(-1) - extra) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		*memptr                = nullptr;
+		return Posix::POSIX_ENOMEM;
+	}
+	void* raw = ::malloc(size + extra);
+	if (raw == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		*memptr                = nullptr;
+		return Posix::POSIX_ENOMEM;
+	}
+	void* user = WinAlignPointer(raw, alignment);
+	{
+		std::lock_guard lock(g_win_aligned_mutex);
+		g_win_aligned.insert_or_assign(user, WinAlignedBlock {raw, size, alignment});
+	}
+	*memptr = user;
+	return 0;
+#else
 	void* p = nullptr;
 	const int rc = ::posix_memalign(&p, alignment, size);
 	if (rc != 0) {
@@ -877,6 +1235,7 @@ static KYTY_SYSV_ABI int posix_memalign_hle(void** memptr, size_t alignment, siz
 	}
 	*memptr = p;
 	return 0;
+#endif
 }
 
 static KYTY_SYSV_ABI void* aligned_alloc_hle(size_t alignment, size_t size) {
@@ -1458,8 +1817,23 @@ static KYTY_SYSV_ABI void* memchr_hle(const void* s, int c, size_t n) {
 	return const_cast<void*>(::memchr(s, c, n));
 }
 
+// memrchr is glibc/BSD-only; macOS and Windows do not provide it.
+static void* Memrchr(const void* s, int c, size_t n) {
+	if (s == nullptr || n == 0) {
+		return nullptr;
+	}
+	const auto* bytes = static_cast<const unsigned char*>(s);
+	const auto  uc    = static_cast<unsigned char>(c);
+	for (size_t i = n; i-- > 0;) {
+		if (bytes[i] == uc) {
+			return const_cast<unsigned char*>(bytes + i);
+		}
+	}
+	return nullptr;
+}
+
 static KYTY_SYSV_ABI void* memrchr_hle(const void* s, int c, size_t n) {
-	return const_cast<void*>(::memrchr(s, c, n));
+	return Memrchr(s, c, n);
 }
 
 static KYTY_SYSV_ABI char* strcasestr_hle(const char* haystack, const char* needle) {
@@ -1500,7 +1874,12 @@ int KYTY_SYSV_ABI getopt_long(int argc, char* const* argv, const char* optstring
 		::optind = 1;
 	}
 
-	// Host struct option is ABI-compatible with GuestOption on LP64.
+	// Host struct option matches GuestOption (LP64, and LLP64 for this layout).
+	static_assert(sizeof(GuestOption) == sizeof(struct option));
+	static_assert(offsetof(GuestOption, name) == offsetof(struct option, name));
+	static_assert(offsetof(GuestOption, has_arg) == offsetof(struct option, has_arg));
+	static_assert(offsetof(GuestOption, flag) == offsetof(struct option, flag));
+	static_assert(offsetof(GuestOption, val) == offsetof(struct option, val));
 	return ::getopt_long(argc, const_cast<char**>(argv), optstring,
 	                     reinterpret_cast<const struct option*>(longopts), longindex);
 }
