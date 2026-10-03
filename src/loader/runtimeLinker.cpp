@@ -27,7 +27,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ucontext.h>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
@@ -38,14 +37,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#else
-#if defined(__APPLE__)
+#elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+// <ucontext.h> errors unless _XOPEN_SOURCE is set; the signal mcontext lives in sys/ucontext.h.
+#include <sys/ucontext.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
-#endif
 #endif
 
 namespace Libs::LibKernel {
@@ -684,12 +684,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		    info->access_violation_vaddr == 0 && info->native_context != nullptr &&
 		    IsReadableRange(info->rsp, sizeof(uint64_t))) {
 			const auto ret = *reinterpret_cast<const uint64_t*>(info->rsp);
-			auto* uctx = static_cast<ucontext_t*>(info->native_context);
 #if defined(__APPLE__)
+			auto* uctx = static_cast<ucontext_t*>(info->native_context);
 			uctx->uc_mcontext->__ss.__rax = 0;
 			uctx->uc_mcontext->__ss.__rsp = static_cast<__uint64_t>(info->rsp + 8);
 			uctx->uc_mcontext->__ss.__rip = static_cast<__uint64_t>(ret);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// native_context is EXCEPTION_POINTERS::ContextRecord, not a POSIX ucontext.
+			auto* ctx = static_cast<CONTEXT*>(info->native_context);
+			ctx->Rax = 0;
+			ctx->Rsp = info->rsp + 8;
+			ctx->Rip = ret;
 #else
+			auto* uctx = static_cast<ucontext_t*>(info->native_context);
 			uctx->uc_mcontext.gregs[REG_RAX] = 0;
 			uctx->uc_mcontext.gregs[REG_RSP] = static_cast<greg_t>(info->rsp + 8);
 			uctx->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(ret);
