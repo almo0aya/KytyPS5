@@ -1022,7 +1022,8 @@ static bool EnsureHostSignalDispatchInstalled() {
 	static const bool installed = [] {
 		struct sigaction action {};
 		action.sa_sigaction = HostSignalDispatchHandler;
-		::sigemptyset(&action.sa_mask);
+		// Apple sigemptyset is a macro (*(set) = 0). A leading :: is not an identifier.
+		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
 		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
 	}();

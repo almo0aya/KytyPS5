@@ -120,13 +120,13 @@ static long random() {
 	return std::rand();
 }
 
-using off_t = long long;
-
-static int fseeko(FILE* stream, off_t offset, int whence) {
+// UCRT already typedefs off_t as 32-bit long. These shims stay 64-bit so the
+// HLE can pass guest off_t (int64) through without truncating.
+static int fseeko(FILE* stream, long long offset, int whence) {
 	return _fseeki64(stream, offset, whence);
 }
 
-static off_t ftello(FILE* stream) {
+static long long ftello(FILE* stream) {
 	return _ftelli64(stream);
 }
 
@@ -1398,7 +1398,12 @@ static KYTY_SYSV_ABI int fseeko_hle(FILE* stream, int64_t offset, int whence) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Host off_t is 32-bit here; the Windows shim takes long long.
+	const int rc = ::fseeko(MapStdStream(stream), offset, whence);
+#else
 	const int rc = ::fseeko(MapStdStream(stream), static_cast<off_t>(offset), whence);
+#endif
 	if (rc != 0) {
 		SetErrnoFromHost();
 	}
@@ -1411,7 +1416,11 @@ static KYTY_SYSV_ABI int64_t ftello_hle(FILE* stream) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto rc = ::ftello(MapStdStream(stream));
+#else
 	const off_t rc = ::ftello(MapStdStream(stream));
+#endif
 	if (rc < 0) {
 		SetErrnoFromHost();
 	}
