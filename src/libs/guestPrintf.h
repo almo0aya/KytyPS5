@@ -20,6 +20,10 @@ guest_printf_ctx_func_t   GetGuestPrintfCtxFunc();
 guest_snprintf_ctx_func_t GetGuestSnprintfCtxFunc();
 guest_vprintf_func_t      GetGuestVprintfFunc();
 
+// Full formatter used by snprintf. Truncates to size-1 and returns the
+// length that would have been written, excluding the terminating NUL.
+int GuestVsnprintf(char* buffer, size_t size, const char* format, VaList* va_list);
+
 } // namespace Libs
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_LIBS_GUEST_PRINTF_H_ */

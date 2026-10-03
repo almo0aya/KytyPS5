@@ -1187,127 +1187,13 @@ static KYTY_SYSV_ABI int remove_hle(const char* path) {
 	return rc;
 }
 
-// Minimal guest-va_list formatter for RetroArch/core-loader diagnostics.
-// Handles literal text plus %s/%d/%u/%zu/%p/%% — enough for fail() messages.
-static int FormatGuestPrintf(char* out, size_t out_size, const char* fmt, VaList* ap) {
-	if (out == nullptr || out_size == 0 || fmt == nullptr) {
-		return -1;
-	}
-	size_t o = 0;
-	auto append = [&](const char* s, size_t n) {
-		if (o + n >= out_size) {
-			n = (o < out_size) ? (out_size - 1 - o) : 0;
-		}
-		if (n > 0) {
-			std::memcpy(out + o, s, n);
-			o += n;
-		}
-	};
-	auto append_str = [&](const char* s) {
-		if (s == nullptr) {
-			s = "(null)";
-		}
-		append(s, std::strlen(s));
-	};
-
-	for (const char* p = fmt; *p != '\0'; ++p) {
-		if (*p != '%' || ap == nullptr) {
-			append(p, 1);
-			continue;
-		}
-		++p;
-		while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' || *p == '0') {
-			++p;
-		}
-		while (*p >= '0' && *p <= '9') {
-			++p;
-		}
-		if (*p == '.') {
-			++p;
-			while (*p >= '0' && *p <= '9') {
-				++p;
-			}
-		}
-		bool is_long = false;
-		bool is_size = false;
-		if (*p == 'l') {
-			is_long = true;
-			++p;
-			if (*p == 'l') {
-				++p;
-			}
-		} else if (*p == 'z') {
-			is_size = true;
-			++p;
-		} else if (*p == 'h') {
-			++p;
-			if (*p == 'h') {
-				++p;
-			}
-		}
-		char tmp[128];
-		switch (*p) {
-			case '%': append("%", 1); break;
-			case 's': append_str(VaArg_ptr<const char>(ap)); break;
-			case 'd':
-			case 'i': {
-				const long long v = is_long || is_size ? VaArg_long_long(ap) : VaArg_int(ap);
-				const int n       = std::snprintf(tmp, sizeof(tmp), "%lld", v);
-				if (n > 0) {
-					append(tmp, static_cast<size_t>(n));
-				}
-				break;
-			}
-			case 'u':
-			case 'x':
-			case 'X': {
-				const unsigned long long v =
-				    is_long || is_size ? static_cast<unsigned long long>(VaArg_long_long(ap))
-				                       : static_cast<unsigned long long>(VaArg_int(ap));
-				const int n = std::snprintf(tmp, sizeof(tmp), (*p == 'u') ? "%llu" : "%llx", v);
-				if (n > 0) {
-					append(tmp, static_cast<size_t>(n));
-				}
-				break;
-			}
-			case 'p': {
-				const auto* ptr = VaArg_ptr<const void>(ap);
-				const int   n   = std::snprintf(tmp, sizeof(tmp), "%p", ptr);
-				if (n > 0) {
-					append(tmp, static_cast<size_t>(n));
-				}
-				break;
-			}
-			case 'c': {
-				tmp[0] = static_cast<char>(VaArg_int(ap));
-				append(tmp, 1);
-				break;
-			}
-			case '\0':
-				--p;
-				break;
-			default: {
-				append("%", 1);
-				append(p, 1);
-				break;
-			}
-		}
-	}
-	out[o] = '\0';
-	return static_cast<int>(o);
-}
-
 static KYTY_SYSV_ABI int vsnprintf_hle(char* buf, size_t size, const char* fmt, VaList* ap) {
 	PRINT_NAME();
-	if (fmt == nullptr) {
+	if (fmt == nullptr || (buf == nullptr && size != 0)) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
 		return -1;
 	}
-	if (buf == nullptr || size == 0) {
-		char tmp[1];
-		return FormatGuestPrintf(tmp, sizeof(tmp), fmt, ap);
-	}
-	return FormatGuestPrintf(buf, size, fmt, ap);
+	return GuestVsnprintf(buf, size, fmt, ap);
 }
 
 static KYTY_SYSV_ABI int vsprintf_hle(char* buf, const char* fmt, VaList* ap) {
@@ -1316,7 +1202,7 @@ static KYTY_SYSV_ABI int vsprintf_hle(char* buf, const char* fmt, VaList* ap) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
 		return -1;
 	}
-	return FormatGuestPrintf(buf, 65536, fmt, ap);
+	return GuestVsnprintf(buf, static_cast<size_t>(-1), fmt, ap);
 }
 
 static KYTY_SYSV_ABI int sprintf_hle(VA_ARGS) {
@@ -1328,7 +1214,7 @@ static KYTY_SYSV_ABI int sprintf_hle(VA_ARGS) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
 		return -1;
 	}
-	return FormatGuestPrintf(buf, 65536, fmt, &ctx.va_list);
+	return GuestVsnprintf(buf, static_cast<size_t>(-1), fmt, &ctx.va_list);
 }
 
 static KYTY_SYSV_ABI int vfprintf_hle(FILE* stream, const char* fmt, VaList* ap) {
@@ -1337,14 +1223,19 @@ static KYTY_SYSV_ABI int vfprintf_hle(FILE* stream, const char* fmt, VaList* ap)
 		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
 		return -1;
 	}
-	char      buf[1024];
-	const int n    = FormatGuestPrintf(buf, sizeof(buf), fmt, ap);
-	FILE*     host = MapStdStream(stream);
+	// Format once to learn the length (va_list copy), then again into a buffer
+	// big enough for the whole string. fprintf does not truncate.
+	VaList          sized = *ap;
+	const int       n     = GuestVsnprintf(nullptr, 0, fmt, &sized);
+	FILE*           host  = MapStdStream(stream);
 	if (n < 0) {
-		return ::fputs(fmt, host) >= 0 ? static_cast<int>(std::strlen(fmt)) : -1;
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
 	}
-	LOGF("\tfprintf: %s", buf);
-	return ::fputs(buf, host) >= 0 ? n : -1;
+	std::vector<char> storage(static_cast<size_t>(n) + 1U);
+	GuestVsnprintf(storage.data(), storage.size(), fmt, ap);
+	LOGF("\tfprintf: %s", storage.data());
+	return ::fputs(storage.data(), host) >= 0 ? n : -1;
 }
 
 static KYTY_SYSV_ABI int fprintf_hle(VA_ARGS) {

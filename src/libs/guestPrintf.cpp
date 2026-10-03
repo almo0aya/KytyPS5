@@ -8,7 +8,6 @@
 #include "libs/guestPrintf.h"
 
 #include "common/abi.h"
-#include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -16,6 +15,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace Libs {
@@ -703,6 +703,11 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			case 's': {
 				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
 				const char* p = VaArg_ptr<const char>(va_list);
+				// FreeBSD/Orbis printf prints "(null)" for a null %s. A null
+				// pointer here is a guest log, not a host crash.
+				if (p == nullptr && (flags & FLAGS_LONG) == 0u) {
+					p = "(null)";
+				}
 				std::string converted;
 				if ((flags & FLAGS_LONG) != 0u) {
 					// The guest ABI uses a 16-bit code unit for wchar_t.
@@ -773,8 +778,17 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		// POSIX/Orbis snprintf writes at most n-1 bytes plus a NUL and returns
+		// the length that would have been written. Truncation is success, not
+		// an unimplemented case. n == 0 (or a null buffer with n == 0) writes
+		// nothing. The return below is that untruncated length.
+		if (sn_n > 0 && sn_s != nullptr) {
+			const size_t copy = idx < sn_n ? idx : sn_n - 1U;
+			if (copy > 0) {
+				std::memcpy(sn_s, buffer.data(), copy);
+			}
+			sn_s[copy] = '\0';
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
@@ -821,6 +835,10 @@ guest_snprintf_ctx_func_t GetGuestSnprintfCtxFunc() {
 
 guest_vprintf_func_t GetGuestVprintfFunc() {
 	return kyty_vprintf;
+}
+
+int GuestVsnprintf(char* buffer, size_t size, const char* format, VaList* va_list) {
+	return kyty_printf_internal(true, buffer, size, format, va_list);
 }
 
 } // namespace Libs
