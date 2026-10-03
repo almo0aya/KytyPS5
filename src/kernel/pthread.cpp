@@ -2734,7 +2734,19 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
+	// Orbis/FreeBSD libthr: a null object is PTHREAD_COND_INITIALIZER, not an
+	// allocated cond. Destroying it allocates nothing and returns success.
+	// (A null cond pointer is still EINVAL above.) Do not fatal here: cores
+	// such as PPSSPP tear down static conds while loading.
+	if (*cond == nullptr) {
+		static std::atomic<int> logged {0};
+		if (logged.exchange(1, std::memory_order_relaxed) == 0) {
+			LOGF("pthread_cond_destroy: null object (PTHREAD_COND_INITIALIZER) at %p, "
+			     "returning 0\n",
+			     static_cast<void*>(cond));
+		}
+		return OK;
+	}
 
 	int result = 0;
 
